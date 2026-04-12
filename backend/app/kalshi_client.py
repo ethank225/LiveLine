@@ -4,13 +4,17 @@ Kalshi API client wrapper using pykalshi.
 Manages authentication, websocket feed, price cache, and order execution.
 
 Required environment variables:
-    KALSHI_API_KEY_ID       - Your Kalshi API key ID
-    KALSHI_PRIVATE_KEY_PATH - Path to your RSA private key PEM file
-    KALSHI_DEMO             - "true" for demo-api.kalshi.co (default), "false" for production
+    KALSHI_{DEMO,PROD}_API_KEY_ID   - API key IDs for each environment
+    KALSHI_{DEMO,PROD}_KEY_B64      - base64-encoded RSA private key PEMs
+                                      (Railway/prod). Locally, drop the PEMs at
+                                      backend/kalshi-{demo,prod}-key.pem instead.
+    KALSHI_ENV                      - "prod" for production, otherwise demo
 """
 
+import base64
 import logging
 import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Callable
@@ -18,6 +22,40 @@ from typing import Callable
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env")
+
+logger = logging.getLogger(__name__)
+
+
+def _decode_pem(env_var: str, fallback_filename: str) -> str | None:
+    """Decode a base64-encoded PEM from env var into a temp file, or fall
+    back to a local file alongside backend/.
+
+    Lets the same code path work locally (reads the PEM off disk) and on
+    Railway/other hosts where the private key arrives as a base64 env var
+    because filesystem writes aren't available at deploy time.
+    """
+    b64 = os.getenv(env_var)
+    if b64:
+        try:
+            pem_bytes = base64.b64decode(b64)
+        except Exception as e:
+            logger.error(f"Failed to base64-decode {env_var}: {e}")
+            return None
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pem", mode="wb")
+        tmp.write(pem_bytes)
+        tmp.close()
+        return tmp.name
+
+    fallback_path = Path(__file__).parent.parent / fallback_filename
+    if fallback_path.exists():
+        return str(fallback_path)
+    return None
+
+
+# Resolve private key paths once at import time. Either resolves to a real
+# file on disk (local dev) or to a temp file decoded from the env var (prod).
+demo_pem_path = _decode_pem("KALSHI_DEMO_KEY_B64", "kalshi-demo-key.pem")
+prod_pem_path = _decode_pem("KALSHI_PROD_KEY_B64", "kalshi-prod-key.pem")
 
 from pykalshi import (
     KalshiClient,
@@ -30,8 +68,6 @@ from pykalshi import (
     Side,
     TimeInForce,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class KalshiManager:
@@ -61,22 +97,17 @@ class KalshiManager:
         """Initialize Kalshi client and start websocket feed."""
         env = os.getenv("KALSHI_ENV", "demo").lower()
         demo = env != "prod"
-        prefix = "KALSHI_DEMO" if demo else "KALSHI_PROD"
 
-        api_key_id = os.getenv(f"{prefix}_API_KEY_ID")
-        private_key_path = os.getenv(f"{prefix}_PRIVATE_KEY_PATH")
+        api_key_id = os.getenv("KALSHI_DEMO_API_KEY_ID" if demo else "KALSHI_PROD_API_KEY_ID")
+        private_key_path = demo_pem_path if demo else prod_pem_path
 
         if not api_key_id or not private_key_path:
+            prefix = "KALSHI_DEMO" if demo else "KALSHI_PROD"
             raise ValueError(
                 f"Kalshi {env} credentials not configured. "
-                f"Set {prefix}_API_KEY_ID and {prefix}_PRIVATE_KEY_PATH in backend/.env"
+                f"Set {prefix}_API_KEY_ID and either {prefix}_KEY_B64 or "
+                f"place the PEM at backend/kalshi-{'demo' if demo else 'prod'}-key.pem"
             )
-
-        # Resolve relative paths against the backend/ directory
-        key_path = Path(private_key_path)
-        if not key_path.is_absolute():
-            key_path = Path(__file__).parent.parent / private_key_path
-        private_key_path = str(key_path)
 
         self.client = KalshiClient(
             api_key_id=api_key_id,
@@ -98,15 +129,11 @@ class KalshiManager:
         # If demo credentials aren't configured, silently skip.
         if not demo:
             demo_key = os.getenv("KALSHI_DEMO_API_KEY_ID")
-            demo_path = os.getenv("KALSHI_DEMO_PRIVATE_KEY_PATH")
-            if demo_key and demo_path:
-                p = Path(demo_path)
-                if not p.is_absolute():
-                    p = Path(__file__).parent.parent / demo_path
+            if demo_key and demo_pem_path:
                 try:
                     self.demo_client = KalshiClient(
                         api_key_id=demo_key,
-                        private_key_path=str(p),
+                        private_key_path=demo_pem_path,
                         demo=True,
                         rate_limiter=RateLimiter(requests_per_second=8.0),
                     )
