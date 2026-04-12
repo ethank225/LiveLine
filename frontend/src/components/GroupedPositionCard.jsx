@@ -80,21 +80,23 @@ function GroupedPositionCard({ positions }) {
         ))}
       </div>
 
-      {/* Footer: combined */}
-      <div className="flex items-center justify-between mt-2 text-xs bg-slate-700/50 rounded px-3 py-2">
-        <span className="text-slate-300">
-          {allTerminal ? 'Combined' : 'Combined potential'}
-        </span>
-        {allTerminal ? (
-          <span className={`font-mono font-bold tabular-nums text-sm ${realizedSum >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-            {realizedSum >= 0 ? '+' : ''}${realizedSum.toFixed(2)}
+      {/* Footer: combined — only meaningful when there's more than one sub */}
+      {positions.length > 1 && (
+        <div className="flex items-center justify-between mt-2 text-xs bg-slate-700/50 rounded px-3 py-2">
+          <span className="text-slate-300">
+            {allTerminal ? 'Combined' : 'Combined potential'}
           </span>
-        ) : (
-          <span className={`font-mono font-bold tabular-nums text-sm ${potentialSum >= 0 ? 'text-blue-400' : 'text-red-400'}`}>
-            ~{potentialSum >= 0 ? '+' : ''}${potentialSum.toFixed(2)}
-          </span>
-        )}
-      </div>
+          {allTerminal ? (
+            <span className={`font-mono font-bold tabular-nums text-sm ${realizedSum >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+              {realizedSum >= 0 ? '+' : ''}${realizedSum.toFixed(2)}
+            </span>
+          ) : (
+            <span className={`font-mono font-bold tabular-nums text-sm ${potentialSum >= 0 ? 'text-blue-400' : 'text-red-400'}`}>
+              ~{potentialSum >= 0 ? '+' : ''}${potentialSum.toFixed(2)}
+            </span>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -129,47 +131,53 @@ function SubPositionInner({ position }) {
   const title = betLabel(position) || position.market_ticker
   const entryC = formatCents(position.entry_price)
   const targetC = formatCents(position.sell_target)
-  const pnl = position.realized_pnl ?? 0
+
+  // Right-side value — never blank. Terminal shows realized P&L, active
+  // shows the live "Now XX¢" price, canceled/unknown falls back to "—".
+  const pnl = position.realized_pnl
+  const current = position.current_price
+  const entry = position.entry_price
+
+  let valueText = '—'
+  let valueColor = 'text-slate-400'
+  if (isTerminal && pnl != null) {
+    valueText = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`
+    valueColor = pnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+  } else if (!isTerminal && current != null) {
+    valueText = `Now ${formatCents(current)}`
+    valueColor = entry != null && current >= entry ? 'text-emerald-400' : 'text-red-400'
+  }
 
   const completedClock = position.completed_at ? formatClock(position.completed_at) : ''
 
-  const rightSide = isTerminal ? (
-    <span className="flex flex-col items-end flex-shrink-0">
-      <span className={`text-[11px] ${config.text}`}>
-        {config.label}
-        {completedClock && (
-          <span className="font-mono ml-1">{completedClock}</span>
-        )}
-      </span>
-      <span className={`font-mono font-bold tabular-nums text-lg leading-tight ${pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-        {pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}
-      </span>
-    </span>
-  ) : (
-    <span className="text-[10px] text-slate-400 font-mono tabular-nums flex-shrink-0">
-      <TradeTimer createdAt={position.created_at} />
-    </span>
-  )
-
   return (
     <div className={`bg-slate-800/50 border-l-[3px] ${config.border} rounded pl-3 pr-3 py-2`}>
-      <div className="flex items-baseline justify-between gap-2">
-        <span className="text-sm text-white font-semibold truncate min-w-0">
+      <div className="flex items-start justify-between gap-2">
+        <span className="text-sm text-white font-semibold truncate min-w-0 flex-1 self-center">
           {title}
           <span className="text-slate-300 font-normal text-xs"> · {entryC} → {targetC}</span>
         </span>
-        {rightSide}
+        <span className="flex flex-col items-end flex-shrink-0">
+          {isTerminal ? (
+            <span className={`text-[11px] ${config.text}`}>
+              {config.label}
+              {completedClock && (
+                <span className="font-mono ml-1">{completedClock}</span>
+              )}
+            </span>
+          ) : (
+            <SubStatusLine
+              createdAt={position.created_at}
+              cleanWindowSec={position.clean_window_seconds ?? 45}
+              openLabel={config.label}
+              isOpen={isOpen}
+            />
+          )}
+          <span className={`font-mono font-bold tabular-nums text-lg leading-tight ${valueColor}`}>
+            {valueText}
+          </span>
+        </span>
       </div>
-      {/* Second row only for open subs — terminal subs already show their
-          status + completion time on the right of the first row. */}
-      {!isTerminal && (
-        <SubCountdownLine
-          createdAt={position.created_at}
-          cleanWindowSec={position.clean_window_seconds ?? 45}
-          openLabel={config.label}
-          isOpen={isOpen}
-        />
-      )}
     </div>
   )
 }
@@ -183,21 +191,20 @@ const SubPosition = memo(SubPositionInner, (prev, next) => {
   return true
 })
 
-// Second-row status + "Ns left" for an open sub. Self-ticks on its own 1 s
-// interval via useTradeCountdown — peers' ticks and parent re-renders can't
-// reset it.
-function SubCountdownLine({ createdAt, cleanWindowSec, openLabel, isOpen }) {
+// Status line on the right side of an active sub. Self-ticks via
+// useTradeCountdown so peers' ticks and parent re-renders can't reset it.
+function SubStatusLine({ createdAt, cleanWindowSec, openLabel, isOpen }) {
   const { remaining, isPending } = useTradeCountdown(
     isOpen ? createdAt : null,
     cleanWindowSec,
   )
   const cfg = isPending ? STATUS_CONFIG.pending_exit : STATUS_CONFIG.open
   return (
-    <div className={`text-[10px] mt-0.5 ${cfg.text}`}>
+    <span className={`text-[11px] whitespace-nowrap ${cfg.text}`}>
       {isPending ? cfg.label : openLabel}
       {isOpen && !isPending && (
         <span className="text-slate-500"> · {remaining}s left</span>
       )}
-    </div>
+    </span>
   )
 }
