@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+MLB-StatsAPI
+pykalshi
+supabase
+pyjwt
+python-dotenv

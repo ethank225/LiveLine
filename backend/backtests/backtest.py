@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""
+Backtest: compare model-predicted deltas to actual Kalshi price moves.
+
+Usage:
+    python backtests/backtest.py --date 2026-04-10
+    python backtests/backtest.py --from 2026-04-07 --to 2026-04-10 --quiet
+    python backtests/backtest.py --date 2026-04-10 --game-id 823482 --trace 3
+    python backtests/backtest.py --date 2026-04-10 --mlb-only
+"""
+
+import argparse
+import os
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent.parent / ".env")
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from backtests.mlb import get_games_for_date, pull_play_by_play
+from backtests.enrichment import enrich_with_model
+from backtests.constants import WINDOW_SECONDS, ENTRY_OFFSET
+from backtests.kalshi_sync import (
+    set_trace_mode, set_stop_loss_analysis,
+    pull_kalshi_trades, sync_plays_with_trades,
+    sync_plays_dynamic_ou, sync_plays_dynamic_spread,
+)
+from backtests.discovery import get_kalshi_client, find_kalshi_event_ticker, discover_game_markets
+from backtests.reports import (
+    print_play_log, print_play_gap_stats, print_stop_loss_analysis,
+    write_stop_loss_csv, print_flagged_summary,
+    print_accuracy_summary, print_timing_analysis,
+)
+from backtests.output import save_csv, print_trace
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Backtest LiveLine engine against historical data")
+    parser.add_argument("--date", type=str, default=None,
+                        help="Single date (YYYY-MM-DD). Defaults to yesterday.")
+    parser.add_argument("--from", dest="from_date", type=str, default=None,
+                        help="Start of date range (YYYY-MM-DD).")
+    parser.add_argument("--to", dest="to_date", type=str, default=None,
+                        help="End of date range (YYYY-MM-DD). Defaults to --from.")
+    parser.add_argument("--game-id", type=int, default=None,
+                        help="Specific MLB game ID (single game only).")
+    parser.add_argument("--event-ticker", type=str, default=None,
+                        help="Kalshi event ticker (e.g. KXMLBGAME-26APR101840AZPHI).")
+    parser.add_argument("--market-ticker", type=str, default=None,
+                        help="Specific Kalshi market ticker (backward compat).")
+    parser.add_argument("--mlb-only", action="store_true",
+                        help="Only pull MLB data, skip Kalshi price comparison.")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Skip per-game play-by-play logs.")
+    parser.add_argument("--trace", type=int, default=0, metavar="N",
+                        help="Print walkthrough for the N highest-delta trades.")
+    parser.add_argument("--stop-loss-analysis", action="store_true",
+                        help="Run stop loss simulation across multiple levels.")
+    args = parser.parse_args()
+
+    if args.trace:
+        set_trace_mode(True)
+    if args.stop_loss_analysis:
+        set_stop_loss_analysis(True)
+
+    # --- Build list of dates ---
+    if args.from_date:
+        d_start = datetime.strptime(args.from_date, "%Y-%m-%d").date()
+        d_end = (datetime.strptime(args.to_date, "%Y-%m-%d").date()
+                 if args.to_date else d_start)
+        dates = []
+        d = d_start
+        while d <= d_end:
+            dates.append(d)
+            d += timedelta(days=1)
+    elif args.date:
+        dates = [datetime.strptime(args.date, "%Y-%m-%d").date()]
+    else:
+        dates = [date.today() - timedelta(days=1)]
+
+    print(f"Backtesting {len(dates)} day(s): "
+          f"{dates[0].isoformat()} — {dates[-1].isoformat()}")
+    print(f"Entry offset: {ENTRY_OFFSET}s before event | "
+          f"Exit window: {WINDOW_SECONDS}s after event")
+
+    # --- Init Kalshi client ---
+    kalshi_client = None
+    if not args.mlb_only:
+        kalshi_client = get_kalshi_client()
+        if kalshi_client:
+            env = os.getenv("KALSHI_ENV", "demo")
+            print(f"Kalshi connected ({env})")
+        else:
+            print("Kalshi credentials not available — running MLB-only")
+
+    # --- Collect across all games ---
+    all_synced: list[dict] = []
+    total_games = 0
+    total_plays = 0
+    games_with_kalshi = 0
+
+    for target in dates:
+        date_str = target.strftime("%m/%d/%Y")
+
+        if args.game_id:
+            game_ids = [args.game_id]
+        else:
+            games = get_games_for_date(date_str)
+            if not games:
+                print(f"\n{target.isoformat()}: no completed games")
+                continue
+            game_ids = [g["game_id"] for g in games]
+
+        print(f"\n{'=' * 70}")
+        print(f"{target.isoformat()} — {len(game_ids)} game(s)")
+        print(f"{'=' * 70}")
+
+        for game_id in game_ids:
+            total_games += 1
+
+            try:
+                records, game_info = pull_play_by_play(game_id)
+            except Exception as e:
+                print(f"  [{game_id}] Failed to pull MLB data: {e}")
+                continue
+
+            total_plays += len(records)
+            tag = f"{game_info['away_abbr']}@{game_info['home_abbr']}"
+
+            enrich_with_model(records)
+
+            if not args.quiet:
+                print_play_log(records, game_info)
+
+            # --- Resolve Kalshi markets ---
+            game_synced: list[dict] = []
+            home_abbr = game_info["home_abbr"].upper()
+            away_abbr = game_info["away_abbr"].upper()
+
+            if kalshi_client and not args.mlb_only:
+                day_start = int(datetime(target.year, target.month, target.day,
+                                         tzinfo=timezone.utc).timestamp())
+                day_end = day_start + 36 * 3600
+
+                if args.market_ticker:
+                    is_away = args.market_ticker.rsplit("-", 1)[-1].upper() == away_abbr
+                    trades = pull_kalshi_trades(kalshi_client, args.market_ticker, day_start, day_end)
+                    if trades:
+                        synced = sync_plays_with_trades(records, trades, is_away_contract=is_away)
+                        game_synced.extend(synced)
+                        side = "away→flipped" if is_away else "home"
+                        print(f"  [{tag}] {len(synced)} plays ({len(trades)} trades, {side})")
+
+                else:
+                    evt = args.event_ticker
+                    if not evt:
+                        evt = find_kalshi_event_ticker(kalshi_client, target, home_abbr, away_abbr)
+
+                    if evt:
+                        specs = discover_game_markets(kalshi_client, evt, home_abbr, away_abbr)
+                        ml_specs = [s for s in specs if s.market_type == "moneyline"]
+                        ou_specs = [s for s in specs if s.market_type == "over_under"]
+                        spread_specs = [s for s in specs if s.market_type == "spread"]
+
+                        for spec in ml_specs:
+                            trades = pull_kalshi_trades(kalshi_client, spec.ticker, day_start, day_end)
+                            if trades:
+                                synced = sync_plays_with_trades(records, trades, spec=spec)
+                                game_synced.extend(synced)
+                                print(f"  [{tag}] {spec.label}: {len(synced)} plays ({len(trades)} trades)")
+
+                        if ou_specs:
+                            ou_trades: dict[str, list] = {}
+                            for sp in ou_specs:
+                                tr = pull_kalshi_trades(kalshi_client, sp.ticker, day_start, day_end)
+                                if tr:
+                                    ou_trades[sp.ticker] = tr
+                            if ou_trades:
+                                synced = sync_plays_dynamic_ou(records, ou_specs, ou_trades)
+                                game_synced.extend(synced)
+                                n_trades = sum(len(t) for t in ou_trades.values())
+                                print(f"  [{tag}] O/U dynamic: {len(synced)} plays "
+                                      f"({len(ou_trades)} markets, {n_trades} trades)")
+
+                        if spread_specs:
+                            spread_trades: dict[str, list] = {}
+                            for sp in spread_specs:
+                                tr = pull_kalshi_trades(kalshi_client, sp.ticker, day_start, day_end)
+                                if tr:
+                                    spread_trades[sp.ticker] = tr
+                            if spread_trades:
+                                synced = sync_plays_dynamic_spread(records, spread_specs, spread_trades)
+                                game_synced.extend(synced)
+                                n_trades = sum(len(t) for t in spread_trades.values())
+                                print(f"  [{tag}] SPR dynamic: {len(synced)} plays "
+                                      f"({len(spread_trades)} markets, {n_trades} trades)")
+                    else:
+                        print(f"  [{tag}] no Kalshi event found")
+
+                if game_synced:
+                    games_with_kalshi += 1
+                    all_synced.extend(game_synced)
+            else:
+                print(f"  [{tag}] {len(records)} plays (MLB only)")
+
+            save_csv(records, game_info, game_synced)
+
+    # --- Combined summary ---
+    print(f"\n{'=' * 70}")
+    print(f"COMBINED RESULTS — {total_games} games, {total_plays} plays")
+    print(f"{'=' * 70}")
+
+    if all_synced:
+        print(f"Games with Kalshi data: {games_with_kalshi}")
+        print_play_gap_stats(all_synced)
+        print_accuracy_summary(all_synced)
+        print_timing_analysis(all_synced)
+        if args.stop_loss_analysis:
+            print_stop_loss_analysis(all_synced)
+            from backtests.output import OUTPUT_DIR
+            write_stop_loss_csv(all_synced, OUTPUT_DIR / "stop_loss_events.csv")
+            print_flagged_summary(all_synced)
+        if args.trace:
+            print_trace(all_synced, args.trace)
+    else:
+        print("No Kalshi price data synced.")
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
