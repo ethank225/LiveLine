@@ -5,6 +5,7 @@ LiveLine API — MLB win expectancy engine + Kalshi trading.
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import date
@@ -91,9 +92,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Comma-separated list of allowed origins. Set CORS_ORIGINS in Railway/prod
+# to the Vercel URL plus any custom domains, e.g.:
+#   CORS_ORIGINS=https://liveline.vercel.app,https://liveline.app
+cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
