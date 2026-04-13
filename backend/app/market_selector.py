@@ -560,10 +560,17 @@ def compute_best_trades(
     sp_market = _pick_spread_market(margin, markets)
     ml_markets = [m for m in markets if m.market_type == "moneyline"]
 
-    if ou_market:
-        logger.debug(f"Game {game_id}: O/U picked {ou_market.label} (total={total_runs})")
-    if sp_market:
-        logger.debug(f"Game {game_id}: Spread picked {sp_market.label} (margin={margin})")
+    sp_candidates = sorted(
+        (m.line for m in markets if m.market_type == "spread"),
+        key=lambda x: x,
+    )
+    logger.info(
+        f"Game {game_id}: score {away_score}-{home_score} "
+        f"margin={margin:+d} total={total_runs} "
+        f"ou_pick={ou_market.label if ou_market else None} "
+        f"sp_pick={sp_market.label if sp_market else None} "
+        f"sp_lines={sp_candidates}"
+    )
 
     # Per-event delta table — useful for debugging, but fires once per
     # subscriber per recompute (every ~2s). Dedupe on a signature of
