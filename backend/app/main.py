@@ -136,10 +136,24 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Comma-separated list of allowed origins. Set CORS_ORIGINS in Railway/prod
-# to the Vercel URL plus any custom domains, e.g.:
-#   CORS_ORIGINS=https://liveline.vercel.app,https://liveline.app
-cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
+# Baseline origins — the dev ports Vite typically picks plus the known
+# deployed hostnames. CORS_ORIGINS (comma-separated) in Railway/prod can
+# ADD to this list without a code change; duplicates are dropped.
+# Starlette's CORSMiddleware returns 400 on a disallowed Origin, so any
+# origin missing here turns into a preflight failure.
+DEFAULT_CORS_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:5175",
+    "https://liveline.watch",
+    "https://www.liveline.watch",
+    "https://live-line-cyan.vercel.app",
+]
+_env_origins = [
+    o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()
+]
+# dict.fromkeys dedupes while preserving first-seen order.
+cors_origins = list(dict.fromkeys(DEFAULT_CORS_ORIGINS + _env_origins))
 
 app.add_middleware(
     CORSMiddleware,

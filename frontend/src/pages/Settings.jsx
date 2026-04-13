@@ -85,7 +85,8 @@ export default function Settings() {
                   value={settings.max_dollars}
                   onChange={v => update('max_dollars', v)}
                   min={1} max={5000} step={50}
-                  format={v => `$${v}`}
+                  editable
+                  prefix="$"
                 />
               }
             />
@@ -268,16 +269,41 @@ function Row({ label, desc, control, dimmed = false, last = false }) {
 // Stepper pill — bg-slate-900 with − and + buttons and the value centered.
 // `format` controls the displayed string (e.g. `$500`, `1¢`, `0.6`), and
 // `valueClass` lets callers tint the value (alpha shows in emerald).
+//
+// When `editable` is passed, the center becomes a typeable input. A
+// local `draft` string holds keystrokes while the input has focus so
+// partial edits (e.g. the empty string while deleting) don't fight the
+// user, and don't kick the auto-save debounce on every character —
+// onChange only fires once, at commit time (blur or Enter). Escape
+// discards the draft. `prefix` renders a non-editable character (e.g.
+// "$") to the left of the digits so the input itself can stay
+// number-only.
 function Stepper({
   value, onChange, min, max, step,
   format = v => String(v),
   valueClass = 'text-white',
   disabled = false,
+  editable = false,
+  prefix = '',
 }) {
   const v = typeof value === 'number' ? value : Number(value) || 0
   const clamped = Math.min(max, Math.max(min, v))
   const dec = () => { if (!disabled) onChange(Math.max(min, round(clamped - step, step))) }
   const inc = () => { if (!disabled) onChange(Math.min(max, round(clamped + step, step))) }
+
+  // null when not being edited; a string while the input has focus.
+  const [draft, setDraft] = useState(null)
+  const commit = () => {
+    if (draft == null) return
+    // Strip anything not a digit, dot, or minus so stray characters
+    // (accidental keystrokes, pasted "$500") don't NaN out.
+    const n = Number(String(draft).replace(/[^\d.-]/g, ''))
+    if (Number.isFinite(n)) {
+      onChange(Math.min(max, Math.max(min, round(n, step))))
+    }
+    setDraft(null)   // back to the formatted, non-focused display
+  }
+
   return (
     <div
       className={`flex items-center bg-slate-900 rounded-full h-9 ${
@@ -292,11 +318,36 @@ function Stepper({
       >
         −
       </button>
-      <div
-        className={`min-w-[50px] text-center text-sm font-semibold font-mono ${valueClass}`}
-      >
-        {format(clamped)}
-      </div>
+      {editable ? (
+        <div
+          className={`flex items-center justify-center min-w-[60px] text-sm
+                      font-semibold font-mono ${valueClass}`}
+        >
+          {prefix && <span className="text-slate-500 pr-0.5">{prefix}</span>}
+          <input
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            value={draft ?? String(clamped)}
+            onFocus={e => { setDraft(String(clamped)); e.target.select() }}
+            onChange={e => setDraft(e.target.value)}
+            onBlur={commit}
+            onKeyDown={e => {
+              if (e.key === 'Enter') e.currentTarget.blur()
+              else if (e.key === 'Escape') { setDraft(null); e.currentTarget.blur() }
+            }}
+            disabled={disabled}
+            aria-label="Value"
+            className="w-14 bg-transparent outline-none text-center font-mono"
+          />
+        </div>
+      ) : (
+        <div
+          className={`min-w-[50px] text-center text-sm font-semibold font-mono ${valueClass}`}
+        >
+          {format(clamped)}
+        </div>
+      )}
       <button
         onClick={inc}
         aria-label="Increase"
