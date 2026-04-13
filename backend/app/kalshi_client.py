@@ -71,6 +71,25 @@ from pykalshi import (
 )
 
 
+def _fill_complementary_side(prices: dict) -> dict:
+    """YES + NO = $1.00 by construction on Kalshi. When one side is missing
+    (common on thin books — we get YES quotes over the ticker feed but no
+    NO quotes), derive it from the other side so NO-side EV checks aren't
+    starved of data.
+    """
+    yb, ya = prices.get("yes_bid", 0), prices.get("yes_ask", 0)
+    nb, na = prices.get("no_bid", 0), prices.get("no_ask", 0)
+    if (not nb) and ya:
+        prices["no_bid"] = round(1.0 - ya, 2)
+    if (not na) and yb:
+        prices["no_ask"] = round(1.0 - yb, 2)
+    if (not yb) and na:
+        prices["yes_bid"] = round(1.0 - na, 2)
+    if (not ya) and nb:
+        prices["yes_ask"] = round(1.0 - nb, 2)
+    return prices
+
+
 class KalshiManager:
     """Manages Kalshi API connectivity, websocket feed, and price cache.
 
@@ -211,12 +230,12 @@ class KalshiManager:
     def _on_ticker(self, msg):
         """Handle incoming websocket ticker messages."""
         ticker = msg.market_ticker
-        prices = {
+        prices = _fill_complementary_side({
             "yes_bid": float(getattr(msg, "yes_bid_dollars", None) or 0),
             "yes_ask": float(getattr(msg, "yes_ask_dollars", None) or 0),
             "no_bid": float(getattr(msg, "no_bid_dollars", None) or 0),
             "no_ask": float(getattr(msg, "no_ask_dollars", None) or 0),
-        }
+        })
         with self._lock:
             self._price_cache[ticker] = prices
 
@@ -291,7 +310,7 @@ class KalshiManager:
 
         result = []
         for m in markets:
-            result.append({
+            row = {
                 "ticker": m.ticker,
                 "event_ticker": getattr(m, "event_ticker", event_ticker),
                 "title": getattr(m, "title", ""),
@@ -302,7 +321,9 @@ class KalshiManager:
                 "no_ask": float(getattr(m, "no_ask_dollars", None) or 0),
                 "volume": str(getattr(m, "volume_fp", "0")),
                 "status": str(getattr(m, "status", "")).split(".")[-1].lower(),
-            })
+            }
+            _fill_complementary_side(row)
+            result.append(row)
         return result
 
     def get_prices(self, market_ticker: str) -> dict:
@@ -317,12 +338,12 @@ class KalshiManager:
 
         try:
             market = self.client.get_market(market_ticker)
-            prices = {
+            prices = _fill_complementary_side({
                 "yes_bid": float(getattr(market, "yes_bid_dollars", None) or 0),
                 "yes_ask": float(getattr(market, "yes_ask_dollars", None) or 0),
                 "no_bid": float(getattr(market, "no_bid_dollars", None) or 0),
                 "no_ask": float(getattr(market, "no_ask_dollars", None) or 0),
-            }
+            })
         except Exception as e:
             logger.error(f"Failed to fetch prices for {market_ticker}: {e}")
             return {"yes_bid": 0, "yes_ask": 0, "no_bid": 0, "no_ask": 0}

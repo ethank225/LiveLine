@@ -143,6 +143,11 @@ _last_compute_sig_lock = threading.Lock()
 _game_scores: dict[int, tuple[int, int]] = {}
 _score_lock = threading.Lock()
 
+# game_id -> (home_abbr, away_abbr) so trade dicts can carry team info
+# for the frontend's NO-side label flip (SEA -4.5 NO → "HOU +4.5").
+_game_teams: dict[int, tuple[str, str]] = {}
+_teams_lock = threading.Lock()
+
 # game_id -> { event: trade_info_dict }
 _trade_cache: dict[int, dict] = {}
 _cache_lock = threading.Lock()
@@ -381,6 +386,8 @@ def discover_markets(
 
     with _market_lock:
         _game_markets[game_id] = infos
+    with _teams_lock:
+        _game_teams[game_id] = (home_abbr.upper(), away_abbr.upper())
     _discovered_games.add(game_id)
 
     return infos
@@ -395,9 +402,13 @@ def _pick_ou_market(total_runs: int, markets: list[MarketInfo]) -> MarketInfo | 
     return pick_ou_line(total_runs, ou_markets)
 
 
-def _pick_spread_market(margin: int, markets: list[MarketInfo]) -> MarketInfo | None:
-    sp_markets = [m for m in markets if m.market_type == "spread"]
-    return pick_spread_line(margin, sp_markets)
+def _pick_spread_markets_both_sides(
+    margin: int, markets: list[MarketInfo]
+) -> list[MarketInfo]:
+    sp = [m for m in markets if m.market_type == "spread"]
+    home_side = pick_spread_line(margin, [m for m in sp if not m.flip])
+    away_side = pick_spread_line(margin, [m for m in sp if m.flip])
+    return [m for m in (home_side, away_side) if m is not None]
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +438,7 @@ def _evaluate_market(
     delta_value: float,
     alpha: float,
     bet_size: int,
+    event: str | None = None,
 ) -> dict | None:
     """Evaluate a single market for one event. Returns trade info or None."""
     prices = kalshi.get_prices(market.ticker)
@@ -441,7 +453,15 @@ def _evaluate_market(
     # the away-side contract. The flip flag handles this.
     d = -delta_value if market.flip else delta_value
 
+    prefix = f"eval[{event or '-'}][{market.label}]"
+    logger.info(
+        f"{prefix} delta_in={delta_value:+.4f} d_eff={d:+.4f} flip={market.flip} "
+        f"yes_bid={yes_bid} yes_ask={yes_ask} no_bid={no_bid} no_ask={no_ask}"
+    )
+
     best = None
+    yes_reason = "skipped: d<=0"
+    no_reason = "skipped: d>=0"
 
     # Dead-market gates. Any side hitting these is a guaranteed loss or no
     # upside — skip it entirely so it never lands in all_trades for
@@ -460,7 +480,12 @@ def _evaluate_market(
         spread = yes_ask - yes_bid
         ev = alpha * d - spread
         sell_target = min(yes_ask + alpha * d, 0.99)
-        if not _is_dead(yes_ask, sell_target):
+        if _is_dead(yes_ask, sell_target):
+            yes_reason = (
+                f"dead: entry={yes_ask:.2f} target={sell_target:.2f} "
+                f"ev={ev:+.4f} spread_cost={spread:.4f}"
+            )
+        else:
             profit_per = sell_target - yes_ask
             best = {
                 "side": "YES",
@@ -470,6 +495,12 @@ def _evaluate_market(
                 "ev_per_contract": round(ev, 4),
                 "profit_per": profit_per,
             }
+            yes_reason = (
+                f"kept: entry={yes_ask:.2f} target={sell_target:.2f} "
+                f"ev={ev:+.4f} spread_cost={spread:.4f}"
+            )
+    elif d > 0:
+        yes_reason = f"skipped: no yes prices (bid={yes_bid} ask={yes_ask})"
 
     # NO side: profitable when delta < 0
     if d < 0 and no_ask > 0 and no_bid > 0:
@@ -477,9 +508,14 @@ def _evaluate_market(
         abs_d = abs(d)
         ev = alpha * abs_d - spread
         sell_target = min(no_ask + alpha * abs_d, 0.99)
-        if not _is_dead(no_ask, sell_target):
+        if _is_dead(no_ask, sell_target):
+            no_reason = (
+                f"dead: entry={no_ask:.2f} target={sell_target:.2f} "
+                f"ev={ev:+.4f} spread_cost={spread:.4f}"
+            )
+        else:
+            profit_per = sell_target - no_ask
             if best is None or ev > best["ev_per_contract"]:
-                profit_per = sell_target - no_ask
                 best = {
                     "side": "NO",
                     "entry_price": round(no_ask, 2),
@@ -488,9 +524,23 @@ def _evaluate_market(
                     "ev_per_contract": round(ev, 4),
                     "profit_per": profit_per,
                 }
+            no_reason = (
+                f"kept: entry={no_ask:.2f} target={sell_target:.2f} "
+                f"ev={ev:+.4f} spread_cost={spread:.4f}"
+            )
+    elif d < 0:
+        no_reason = f"skipped: no no prices (bid={no_bid} ask={no_ask})"
+
+    logger.info(f"{prefix}   YES {yes_reason}")
+    logger.info(f"{prefix}   NO  {no_reason}")
 
     if best is None:
+        logger.info(f"{prefix} → no trade")
         return None
+    logger.info(
+        f"{prefix} → trade side={best['side']} entry={best['entry_price']} "
+        f"target={best['sell_target']} ev={best['ev_per_contract']:+.4f}"
+    )
 
     return {
         "event": None,  # filled by caller
@@ -541,6 +591,8 @@ def compute_best_trades(
 
     with _market_lock:
         markets = list(_game_markets.get(game_id, []))
+    with _teams_lock:
+        home_abbr, away_abbr = _game_teams.get(game_id, ("", ""))
 
     # If scores not passed, try cached scores
     if home_score is None or away_score is None:
@@ -557,18 +609,19 @@ def compute_best_trades(
 
     # Dynamically pick O/U and spread markets
     ou_market = _pick_ou_market(total_runs, markets)
-    sp_market = _pick_spread_market(margin, markets)
+    sp_markets_picked = _pick_spread_markets_both_sides(margin, markets)
     ml_markets = [m for m in markets if m.market_type == "moneyline"]
 
     sp_candidates = sorted(
         (m.line for m in markets if m.market_type == "spread"),
         key=lambda x: x,
     )
+    sp_picks_labels = [m.label for m in sp_markets_picked]
     logger.info(
         f"Game {game_id}: score {away_score}-{home_score} "
         f"margin={margin:+d} total={total_runs} "
         f"ou_pick={ou_market.label if ou_market else None} "
-        f"sp_pick={sp_market.label if sp_market else None} "
+        f"sp_picks={sp_picks_labels} "
         f"sp_lines={sp_candidates}"
     )
 
@@ -576,15 +629,15 @@ def compute_best_trades(
     # subscriber per recompute (every ~2s). Dedupe on a signature of
     # (deltas, lines, scores) so we only print when something changed.
     ou_key = str(ou_market.line) if ou_market else None
-    sp_key = str(sp_market.line) if sp_market else None
+    sp_keys = [str(m.line) for m in sp_markets_picked]
     sig_parts: list[str] = [
-        f"ou={ou_key}", f"sp={sp_key}",
+        f"ou={ou_key}", f"sp={','.join(sp_keys)}",
         f"hs={home_score}", f"as={away_score}",
     ]
     for d in deltas:
         ou_d = d.over_under.get(ou_key, {}).get("delta") if ou_key else None
-        sp_d = d.spread.get(sp_key, {}).get("delta") if sp_key else None
-        sig_parts.append(f"{d.event}:{d.delta:+.4f}:{ou_d}:{sp_d}")
+        sp_ds = [d.spread.get(k, {}).get("delta") for k in sp_keys]
+        sig_parts.append(f"{d.event}:{d.delta:+.4f}:{ou_d}:{sp_ds}")
     sig = "|".join(sig_parts)
 
     with _last_compute_sig_lock:
@@ -596,16 +649,20 @@ def compute_best_trades(
     if changed:
         logger.info(
             f"compute_best_trades game={game_id} "
-            f"ou_line={ou_key} sp_line={sp_key} "
+            f"ou_line={ou_key} sp_lines={sp_keys} "
             f"ml_markets={len(ml_markets)} total_runs={total_runs} margin={margin}"
         )
         for d in deltas:
             ou_delta = d.over_under.get(ou_key, {}).get("delta") if ou_key else None
-            sp_delta = d.spread.get(sp_key, {}).get("delta") if sp_key else None
+            sp_deltas = {k: d.spread.get(k, {}).get("delta") for k in sp_keys}
+            sp_delta_str = ", ".join(
+                f"{k}={'None' if v is None else f'{v:+.4f}'}"
+                for k, v in sp_deltas.items()
+            ) or "None"
             logger.info(
                 f"  event={d.event:<3} ml_delta={d.delta:+.4f} "
                 f"ou_delta={ou_delta if ou_delta is None else f'{ou_delta:+.4f}'} "
-                f"sp_delta={sp_delta if sp_delta is None else f'{sp_delta:+.4f}'}"
+                f"sp_deltas=[{sp_delta_str}]"
             )
 
     result: dict[str, dict] = {}
@@ -620,7 +677,7 @@ def compute_best_trades(
         # --- Moneyline candidates ---
         if not (blowout_filter and is_blowout):
             for ml in ml_markets:
-                trade = _evaluate_market(ml, d.delta, alpha, bet_size)
+                trade = _evaluate_market(ml, d.delta, alpha, bet_size, event=d.event)
                 if trade:
                     candidates.append(trade)
 
@@ -628,15 +685,15 @@ def compute_best_trades(
         if ou_market:
             ou_delta_data = d.over_under.get(str(ou_market.line))
             if ou_delta_data:
-                trade = _evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size)
+                trade = _evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event)
                 if trade:
                     candidates.append(trade)
 
-        # --- Spread candidate ---
-        if sp_market:
+        # --- Spread candidates (home-side + away-side) ---
+        for sp_market in sp_markets_picked:
             sp_delta_data = d.spread.get(str(sp_market.line))
             if sp_delta_data:
-                trade = _evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size)
+                trade = _evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event)
                 if trade:
                     candidates.append(trade)
 
@@ -646,10 +703,13 @@ def compute_best_trades(
             best_trade = dict(candidates[0])
             best_trade["event"] = d.event
             best_trade["active"] = best_trade["ev_per_contract"] > 0
+            best_trade["home_abbr"] = home_abbr
+            best_trade["away_abbr"] = away_abbr
             # all_trades is the full positive-EV basket. Frontend ignores
             # it in single-market mode; backend reads it in multi mode.
             best_trade["all_trades"] = [
-                {**c, "event": d.event} for c in candidates
+                {**c, "event": d.event, "home_abbr": home_abbr, "away_abbr": away_abbr}
+                for c in candidates
                 if c["ev_per_contract"] > 0
             ]
             result[d.event] = best_trade

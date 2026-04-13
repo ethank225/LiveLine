@@ -25,7 +25,7 @@ from app.market_selector import (
     _notify_sse,
     _game_markets,
     _pick_ou_market,
-    _pick_spread_market,
+    _pick_spread_markets_both_sides,
     compute_best_trades,
     discover_markets,
     get_cached_trades,
@@ -61,9 +61,7 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("pykalshi").setLevel(logging.WARNING)
-# Market selector: hide the per-compute delta table + discovery logs.
-# Warnings/errors (no Kalshi event, flush failures) still come through.
-logging.getLogger("app.market_selector").setLevel(logging.WARNING)
+logging.getLogger("app.market_selector").setLevel(logging.INFO)
 
 
 class _QuietAccessLogFilter(logging.Filter):
@@ -992,7 +990,7 @@ async def debug_evaluate(
     total_runs = info.home_score + info.away_score
     margin = info.home_score - info.away_score
     ou_market = _pick_ou_market(total_runs, markets)
-    sp_market = _pick_spread_market(margin, markets)
+    sp_markets_picked = _pick_spread_markets_both_sides(margin, markets)
 
     def line_info(market, delta_value):
         prices = kalshi.get_prices(market.ticker)
@@ -1032,8 +1030,10 @@ async def debug_evaluate(
     if ou_market:
         ou_delta = d.over_under.get(str(ou_market.line), {}).get("delta", 0)
         result["ou_candidate"] = line_info(ou_market, ou_delta)
-    if sp_market:
-        sp_delta = d.spread.get(str(sp_market.line), {}).get("delta", 0)
-        result["spread_candidate"] = line_info(sp_market, sp_delta)
+    if sp_markets_picked:
+        result["spread_candidates"] = [
+            line_info(m, d.spread.get(str(m.line), {}).get("delta", 0))
+            for m in sp_markets_picked
+        ]
 
     return result

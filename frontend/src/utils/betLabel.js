@@ -27,26 +27,35 @@ function moneylineAbbr(ticker) {
   return /^[A-Z]{2,4}$/.test(last) ? last : null
 }
 
-function spreadAbbr(ticker) {
-  // Last segment is like "COL4" or "SD5" — letters followed by digits
+function spreadInfo(ticker) {
+  // Last segment is like "COL4" or "SD5" — letters then integer N.
+  // Kalshi convention: line = N - 0.5 (e.g. SEA4 → SEA -3.5)
   const parts = ticker?.split('-')
   if (!parts) return null
   const last = parts[parts.length - 1] || ''
-  const match = last.match(/^([A-Z]{2,4})\d+$/)
-  return match ? match[1] : null
+  const match = last.match(/^([A-Z]{2,4})(\d+)$/)
+  if (!match) return null
+  return { abbr: match[1], line: parseInt(match[2], 10) - 0.5 }
+}
+
+function otherTeam(abbr, home, away) {
+  if (!abbr) return null
+  if (home && abbr === home) return away || null
+  if (away && abbr === away) return home || null
+  return null
 }
 
 export function betLabel(obj) {
   if (!obj) return null
   const ticker = obj.market_ticker || ''
-  const title = obj.market_title || ''
   const side = obj.side
   const mt = obj.market_type || inferMarketType(ticker)
+  const home = obj.home_abbr || ''
+  const away = obj.away_abbr || ''
 
   if (!side) return null
 
   if (mt === 'over_under') {
-    // Last segment of ticker is the line: KXMLBTOTAL-...-7 → "7"
     const linePart = ticker?.split('-').pop()
     const line = linePart?.match(/^\d+(?:\.\d+)?$/)?.[0]
     if (line) return side === 'YES' ? `Over ${line}` : `Under ${line}`
@@ -54,10 +63,12 @@ export function betLabel(obj) {
   }
 
   if (mt === 'spread') {
-    const abbr = spreadAbbr(ticker)
-    const line = title.match(/\d+(?:\.\d+)?/)?.[0]
-    if (abbr && line) {
-      return side === 'YES' ? `${abbr} -${line}` : `${abbr} +${line}`
+    const info = spreadInfo(ticker)
+    if (info) {
+      if (side === 'YES') return `${info.abbr} -${info.line}`
+      // NO on "SEA -4.5" = bet against SEA covering = "HOU +4.5"
+      const flipped = otherTeam(info.abbr, home, away) || info.abbr
+      return `${flipped} +${info.line}`
     }
     return `${side} Spread`
   }
@@ -65,7 +76,10 @@ export function betLabel(obj) {
   if (mt === 'moneyline') {
     const abbr = moneylineAbbr(ticker)
     if (abbr) {
-      return side === 'YES' ? `${abbr} wins` : `${abbr} loses`
+      if (side === 'YES') return `${abbr} wins`
+      // NO on "SEA wins" = bet SEA loses = "HOU wins"
+      const flipped = otherTeam(abbr, home, away)
+      return flipped ? `${flipped} wins` : `${abbr} loses`
     }
     return side === 'YES' ? 'Home wins' : 'Home loses'
   }
