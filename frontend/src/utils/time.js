@@ -16,6 +16,34 @@ if (typeof window !== 'undefined') {
     _now = Date.now()
     _subs.forEach((cb) => cb())
   }, TICK_MS)
+
+  // Backgrounded tabs throttle setInterval (Chrome caps at ~1/s, some
+  // browsers deeper). When the user returns, push an immediate tick so
+  // every useSharedNow() consumer recomputes from the real clock without
+  // waiting up to TICK_MS for the next scheduled fire.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      _now = Date.now()
+      _subs.forEach((cb) => cb())
+    }
+  })
+}
+
+/**
+ * Register a callback that fires every time the tab becomes visible.
+ * Returns an unsubscribe function.
+ *
+ * Use this in any `useEffect` that owns a setInterval-driven timer so
+ * the timer snaps to the real elapsed time the instant the tab wakes
+ * up, instead of waiting for its own interval to catch up.
+ */
+export function onVisible(cb) {
+  if (typeof document === 'undefined') return () => {}
+  const handler = () => {
+    if (document.visibilityState === 'visible') cb()
+  }
+  document.addEventListener('visibilitychange', handler)
+  return () => document.removeEventListener('visibilitychange', handler)
 }
 
 function subscribe(cb) {
@@ -98,13 +126,20 @@ export function useTradeCountdown(createdAt, totalSec) {
     if (!startMs) return
     // Captures the current startMs + totalSec. When either changes, useEffect
     // clears and restarts with fresh values — no ref gymnastics needed.
-    const iv = setInterval(() => {
+    const tick = () => {
       const elapsedSec = (Date.now() - startMs) / 1000
       const remaining = Math.max(0, Math.ceil(totalSec - elapsedSec))
       const pct = Math.max(0, 100 - (elapsedSec / totalSec) * 100)
       setState({ remaining, pct, isPending: remaining <= 0 })
-    }, 1000)
-    return () => clearInterval(iv)
+    }
+    const iv = setInterval(tick, 1000)
+    // Re-tick the moment the tab wakes so a 30s background gap doesn't
+    // leave the card showing a stale "33s left" for up to another second.
+    const offVisible = onVisible(tick)
+    return () => {
+      clearInterval(iv)
+      offVisible()
+    }
   }, [startMs, totalSec])
 
   return state

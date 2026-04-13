@@ -3,17 +3,19 @@ import { betLabel } from '../utils/betLabel'
 import { formatClock, useTradeCountdown } from '../utils/time'
 import { TradeTimer } from './TradeTimer'
 
-// Mirrors the status palette from PositionCard so the visual language stays
-// consistent between single and grouped cards.
+// Mirrors PositionCard.STATUS_CONFIG — kept in sync by hand (see that
+// file for reasoning). Grouped subs don't render a progress bar, so the
+// `bar` key is unused here but preserved so the two configs stay
+// structurally identical.
 const STATUS_CONFIG = {
-  undo_window:      { border: 'border-blue-500',    bg: 'bg-blue-500/10',    label: 'Waiting for fill',     text: 'text-blue-400',    bar: 'bg-blue-500/70' },
-  open:             { border: 'border-blue-500',    bg: 'bg-blue-500/10',    label: 'Waiting for fill',     text: 'text-blue-400',    bar: 'bg-blue-500/70' },
-  pending_exit:     { border: 'border-amber-500',   bg: 'bg-amber-500/10',   label: 'Exiting at market...', text: 'text-amber-400',   bar: 'bg-amber-500/70' },
-  filled:           { border: 'border-emerald-500', bg: 'bg-emerald-500/10', label: 'Filled at target',     text: 'text-emerald-400', bar: 'bg-emerald-500/70' },
-  expired:          { border: 'border-red-500',     bg: 'bg-red-500/10',     label: 'Expired at market',    text: 'text-red-400',     bar: 'bg-red-500/70' },
-  stopped:          { border: 'border-red-500',     bg: 'bg-red-500/10',     label: 'Stopped out',          text: 'text-red-400',     bar: 'bg-red-500/70' },
-  canceled:         { border: 'border-slate-600',   bg: 'bg-slate-800/60',   label: 'Canceled',             text: 'text-slate-400',   bar: 'bg-slate-600' },
-  canceled_by_user: { border: 'border-slate-600',   bg: 'bg-slate-800/60',   label: 'Canceled',             text: 'text-slate-400',   bar: 'bg-slate-600' },
+  undo_window:      { border: 'border-blue-500',    label: 'Waiting for fill',     text: 'text-blue-400',    value: 'text-blue-400' },
+  open:             { border: 'border-blue-500',    label: 'Waiting for fill',     text: 'text-blue-400',    value: 'text-blue-400' },
+  pending_exit:     { border: 'border-amber-500',   label: 'Exiting at market...', text: 'text-amber-400',   value: 'text-amber-400' },
+  filled:           { border: 'border-emerald-500', label: 'Filled',               text: 'text-emerald-400', value: 'text-emerald-400' },
+  expired:          { border: 'border-red-500',     label: 'Expired',              text: 'text-red-400',     value: 'text-red-400' },
+  stopped:          { border: 'border-red-500',     label: 'Stopped out',          text: 'text-red-400',     value: 'text-red-400' },
+  canceled:         { border: 'border-slate-600',   label: 'Canceled',             text: 'text-slate-400',   value: 'text-slate-400' },
+  canceled_by_user: { border: 'border-slate-600',   label: 'Canceled',             text: 'text-slate-400',   value: 'text-slate-400' },
 }
 
 const TERMINAL = new Set(['filled', 'expired', 'stopped', 'canceled', 'canceled_by_user'])
@@ -23,22 +25,45 @@ function formatCents(p) {
   return `${Math.round(p * 100)}¢`
 }
 
-function subFields(p) {
-  // Tuple used by the memo comparator — only these affect the sub's DOM.
-  return [p.status, p.realized_pnl, p.current_price, p.exit_price]
+function formatPnl(x) {
+  if (x >= 0) return `+$${x.toFixed(2)}`
+  return `-$${Math.abs(x).toFixed(2)}`
 }
 
-// A grouped card consumes an array of positions that all share an
-// undo_group_id and renders them as sub-rows inside one outer card.
+function subFields(p) {
+  // Tuple used by the sub-row memo — only these affect the DOM.
+  return [p.status, p.realized_pnl, p.current_price, p.exit_price, p.completed_at]
+}
+
+// ---------------------------------------------------------------------------
+// Multi-position card
+//
+// Layout (mockup):
+//     HR  [3 markets]                      8s ago
+//   ┃ Over 8.5                             Filled
+//   ┃ 45¢ → 57¢                         +$4.80
+//   ┃ ATL -2.5                           22s left
+//   ┃ 40¢ → 52¢                          Now 44¢
+//   ┃ CLE wins                            Expired
+//   ┃ 38¢ → 42¢                         -$1.20
+//     Combined                          +$3.60
+//
+// Outer card has no left border (subs own their own). The "Combined"
+// footer is plain (no inner background), just a baseline-aligned row.
+// ---------------------------------------------------------------------------
+
 function GroupedPositionCard({ positions }) {
   if (!positions?.length) return null
+  // A length-1 basket shouldn't reach this component anymore (PositionCard
+  // handles singles directly), but render defensively just in case.
   const event = positions[0].event
   const terminalCount = positions.filter(p => TERMINAL.has(p.status)).length
   const allTerminal = terminalCount === positions.length
-  const realizedSum = positions.reduce((s, p) => s + (p.realized_pnl ?? 0), 0)
 
-  // Potential: sum of (target - entry) * qty for open positions +
-  // realized for terminal ones. Gives a meaningful "combined" line.
+  const realizedSum = positions.reduce((s, p) => s + (p.realized_pnl ?? 0), 0)
+  // Potential: sum of (target - entry) * qty for still-open legs + the
+  // realized amount for anything that already settled. Gives a single
+  // "where this basket is headed" number while it's in flight.
   const potentialSum = positions.reduce((s, p) => {
     if (TERMINAL.has(p.status)) return s + (p.realized_pnl ?? 0)
     const qty = p.quantity ?? 0
@@ -47,8 +72,8 @@ function GroupedPositionCard({ positions }) {
     return s + (target - entry) * qty
   }, 0)
 
-  // Group age uses the earliest sub-position's created_at — all members of a
-  // group fire from a single tap, so timestamps match within ms.
+  // Group age uses the earliest created_at — all members fire off one tap
+  // so timestamps are within ms of each other.
   const groupCreatedAt = positions
     .map(p => p.created_at)
     .filter(Boolean)
@@ -56,17 +81,15 @@ function GroupedPositionCard({ positions }) {
 
   return (
     <div className="rounded-lg bg-slate-800 p-3 mb-2">
-      {/* Header: event + count · self-ticking timestamp */}
-      <div className="flex items-baseline justify-between mb-2 gap-2">
-        <div className="text-sm font-semibold text-white truncate">
-          {event}
-          {positions.length > 1 && (
-            <span className="text-slate-400 font-normal text-xs ml-2 px-1.5 py-0.5 rounded bg-slate-700/60">
-              {positions.length} positions
-            </span>
-          )}
+      {/* Header: event + count pill · timestamp */}
+      <div className="flex items-baseline justify-between gap-2 mb-2">
+        <div className="text-sm truncate min-w-0 flex-1">
+          <span className="font-bold text-white">{event}</span>
+          <span className="ml-2 text-[11px] px-2 py-0.5 rounded bg-slate-700/60 text-slate-300 whitespace-nowrap">
+            {positions.length} markets
+          </span>
         </div>
-        <span className="text-[10px] text-slate-400 font-mono tabular-nums flex-shrink-0">
+        <span className="text-[11px] text-slate-400 font-mono tabular-nums flex-shrink-0">
           {allTerminal
             ? formatClock(groupCreatedAt)
             : <TradeTimer createdAt={groupCreatedAt} />}
@@ -76,33 +99,30 @@ function GroupedPositionCard({ positions }) {
       {/* Sub-positions */}
       <div className="space-y-1">
         {positions.map((p) => (
-          <SubPosition key={p.id || p.position_id} position={p} />
+          <SubRow key={p.id || p.position_id} position={p} />
         ))}
       </div>
 
-      {/* Footer: combined — only meaningful when there's more than one sub */}
-      {positions.length > 1 && (
-        <div className="flex items-center justify-between mt-2 text-xs bg-slate-700/50 rounded px-3 py-2">
-          <span className="text-slate-300">
-            {allTerminal ? 'Combined' : 'Combined potential'}
+      {/* Combined footer — plain row, no inner background */}
+      <div className="flex items-baseline justify-between mt-2 px-0.5">
+        <span className="text-sm text-slate-400">
+          {allTerminal ? 'Combined' : 'Combined potential'}
+        </span>
+        {allTerminal ? (
+          <span className={`font-mono font-bold tabular-nums text-base ${realizedSum >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+            {formatPnl(realizedSum)}
           </span>
-          {allTerminal ? (
-            <span className={`font-mono font-bold tabular-nums text-sm ${realizedSum >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-              {realizedSum >= 0 ? '+' : ''}${realizedSum.toFixed(2)}
-            </span>
-          ) : (
-            <span className={`font-mono font-bold tabular-nums text-sm ${potentialSum >= 0 ? 'text-blue-400' : 'text-red-400'}`}>
-              ~{potentialSum >= 0 ? '+' : ''}${potentialSum.toFixed(2)}
-            </span>
-          )}
-        </div>
-      )}
+        ) : (
+          <span className={`font-mono font-bold tabular-nums text-base ${potentialSum >= 0 ? 'text-blue-400' : 'text-red-400'}`}>
+            ~{formatPnl(potentialSum)}
+          </span>
+        )}
+      </div>
     </div>
   )
 }
 
-// Skip re-render when parent SSE ticks produce new array identity but the
-// status/pnl/price of each sub is unchanged.
+// Skip parent-driven re-renders when nothing material changed.
 export default memo(GroupedPositionCard, (prev, next) => {
   const a = prev.positions || []
   const b = next.positions || []
@@ -119,70 +139,80 @@ export default memo(GroupedPositionCard, (prev, next) => {
 
 
 // ---------------------------------------------------------------------------
-// Sub-position — memoized so a tick in one sub doesn't re-render its peers
+// Sub-row — one leg of a basket. Memoized so a tick / SSE flush touching
+// one leg doesn't re-render its siblings.
+//
+//   ┃ Over 8.5                             Filled
+//   ┃ 45¢ → 57¢                         +$4.80
 // ---------------------------------------------------------------------------
 
-function SubPositionInner({ position }) {
+function SubRowInner({ position }) {
   const status = position.status || 'open'
   const isOpen = status === 'open' || status === 'undo_window'
   const isTerminal = TERMINAL.has(status)
-  const config = STATUS_CONFIG[status] || STATUS_CONFIG.open
+
+  const { isPending, remaining } = useTradeCountdown(
+    isOpen ? position.created_at : null,
+    position.clean_window_seconds ?? 45,
+  )
+  const effective = (isPending && isOpen) ? 'pending_exit' : status
+  const cfg = STATUS_CONFIG[effective] || STATUS_CONFIG.open
 
   const title = betLabel(position) || position.market_ticker
   const entryC = formatCents(position.entry_price)
   const targetC = formatCents(position.sell_target)
 
-  // Right-side value — never blank. Terminal shows realized P&L, active
-  // shows the live "Now XX¢" price, canceled/unknown falls back to "—".
-  const pnl = position.realized_pnl
-  const current = position.current_price
-  const entry = position.entry_price
-
-  let valueText = '—'
-  let valueColor = 'text-slate-400'
-  if (isTerminal && pnl != null) {
-    valueText = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`
-    valueColor = pnl >= 0 ? 'text-emerald-400' : 'text-red-400'
-  } else if (!isTerminal && current != null) {
-    valueText = `Now ${formatCents(current)}`
-    valueColor = entry != null && current >= entry ? 'text-emerald-400' : 'text-red-400'
+  // Right-top: status label (+ clock for terminal legs).
+  let statusLine
+  if (isTerminal) {
+    statusLine = cfg.label
+  } else if (isPending) {
+    statusLine = cfg.label
+  } else {
+    statusLine = `${remaining}s left`
   }
 
-  const completedClock = position.completed_at ? formatClock(position.completed_at) : ''
+  // Right-bottom: value. Same rules as PositionCard — PnL for terminal,
+  // live "Now NN¢" for active.
+  let valueEl = null
+  const pnl = position.realized_pnl
+  if (isTerminal && pnl != null) {
+    const color = pnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+    valueEl = (
+      <span className={`font-mono font-bold tabular-nums text-lg ${color}`}>
+        {formatPnl(pnl)}
+      </span>
+    )
+  } else if (!isTerminal) {
+    const current = position.current_price
+    valueEl = (
+      <span className={`font-mono font-bold tabular-nums text-lg ${cfg.value}`}>
+        Now {formatCents(current)}
+      </span>
+    )
+  }
 
   return (
-    <div className={`bg-slate-800/50 border-l-[3px] ${config.border} rounded pl-3 pr-3 py-2`}>
-      <div className="flex items-start justify-between gap-2">
-        <span className="text-sm text-white font-semibold truncate min-w-0 flex-1 self-center">
+    <div className={`bg-slate-800/60 border-l-[3px] ${cfg.border} rounded pl-3 pr-3 py-2 transition-[border-color] duration-700 ease-out`}>
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-sm font-semibold text-white truncate min-w-0 flex-1">
           {title}
-          <span className="text-slate-300 font-normal text-xs"> · {entryC} → {targetC}</span>
         </span>
-        <span className="flex flex-col items-end flex-shrink-0">
-          {isTerminal ? (
-            <span className={`text-[11px] ${config.text}`}>
-              {config.label}
-              {completedClock && (
-                <span className="font-mono ml-1">{completedClock}</span>
-              )}
-            </span>
-          ) : (
-            <SubStatusLine
-              createdAt={position.created_at}
-              cleanWindowSec={position.clean_window_seconds ?? 45}
-              openLabel={config.label}
-              isOpen={isOpen}
-            />
-          )}
-          <span className={`font-mono font-bold tabular-nums text-lg leading-tight ${valueColor}`}>
-            {valueText}
-          </span>
+        <span className={`text-xs whitespace-nowrap flex-shrink-0 ${cfg.text} ${isPending ? 'animate-pulse' : ''}`}>
+          {statusLine}
         </span>
+      </div>
+      <div className="flex items-baseline justify-between gap-2 mt-0.5">
+        <span className="text-[11px] text-slate-500 font-mono tabular-nums">
+          {entryC} → {targetC}
+        </span>
+        {valueEl}
       </div>
     </div>
   )
 }
 
-const SubPosition = memo(SubPositionInner, (prev, next) => {
+const SubRow = memo(SubRowInner, (prev, next) => {
   const af = subFields(prev.position)
   const bf = subFields(next.position)
   for (let i = 0; i < af.length; i++) {
@@ -190,21 +220,3 @@ const SubPosition = memo(SubPositionInner, (prev, next) => {
   }
   return true
 })
-
-// Status line on the right side of an active sub. Self-ticks via
-// useTradeCountdown so peers' ticks and parent re-renders can't reset it.
-function SubStatusLine({ createdAt, cleanWindowSec, openLabel, isOpen }) {
-  const { remaining, isPending } = useTradeCountdown(
-    isOpen ? createdAt : null,
-    cleanWindowSec,
-  )
-  const cfg = isPending ? STATUS_CONFIG.pending_exit : STATUS_CONFIG.open
-  return (
-    <span className={`text-[11px] whitespace-nowrap ${cfg.text}`}>
-      {isPending ? cfg.label : openLabel}
-      {isOpen && !isPending && (
-        <span className="text-slate-500"> · {remaining}s left</span>
-      )}
-    </span>
-  )
-}

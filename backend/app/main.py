@@ -45,6 +45,7 @@ from app.trader import (
     TradeGroup,
     cancel_position,
     check_stop_losses,
+    cleanup_orphaned_liveline_orders,
     execute_trade,
     find_trade,
     get_pnl,
@@ -101,6 +102,15 @@ async def lifespan(app: FastAPI):
         kalshi.on_tick(on_price_update)
         kalshi.on_tick(check_stop_losses)
         logger.info("Kalshi integration active")
+        # Reconcile orphaned state from a prior crash: cancel any resting
+        # LiveLine-tagged orders (safe — prefix filter won't touch other
+        # activity) and flag open MLB positions for manual review.
+        # Offloaded to a thread so a slow/flaky Kalshi response doesn't
+        # block the app from accepting requests.
+        try:
+            await asyncio.to_thread(cleanup_orphaned_liveline_orders)
+        except Exception as e:
+            logger.warning(f"[STARTUP] cleanup skipped: {e}")
     except Exception as e:
         logger.warning(f"Kalshi connection failed (trading disabled): {e}")
 

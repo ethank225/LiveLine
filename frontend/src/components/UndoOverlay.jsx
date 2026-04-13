@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { onVisible } from '../utils/time'
 
 // Stacked undo overlay. The parent owns an array of pending entries; this
 // component renders the most recent one, badges how many more are stacked,
@@ -24,7 +25,7 @@ export default function UndoOverlay({ queue, onUndo, onEntryExpire }) {
   const notifiedRef = useRef(new Set())
 
   useEffect(() => {
-    const iv = setInterval(() => {
+    const tick = () => {
       const now = Date.now()
       for (const e of queueRef.current) {
         if (e.expireAt <= now && !notifiedRef.current.has(e.position_id)) {
@@ -33,8 +34,16 @@ export default function UndoOverlay({ queue, onUndo, onEntryExpire }) {
         }
       }
       setNow(now)
-    }, 50)
-    return () => clearInterval(iv)
+    }
+    const iv = setInterval(tick, 50)
+    // Backgrounded tabs throttle this 50ms interval dramatically — an
+    // undo window that expired in the background otherwise wouldn't
+    // fire onEntryExpire until the tab's next wake tick. Run it now.
+    const offVisible = onVisible(tick)
+    return () => {
+      clearInterval(iv)
+      offVisible()
+    }
   }, [])
 
   if (!queue.length) return null

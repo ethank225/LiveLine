@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ageLabel } from '../utils/time'
+import { ageLabel, onVisible } from '../utils/time'
 
 // Self-ticking age component. Each instance owns its own setInterval + state,
 // so a parent re-render (e.g. SSE price tick flushing new `position`
@@ -16,10 +16,15 @@ export function TradeTimer({ createdAt, closedAt }) {
   )
   useEffect(() => {
     if (!startMs || closedAt) return
-    const iv = setInterval(() => {
-      setLabel(ageLabel(startMs, Date.now()))
-    }, 1000)
-    return () => clearInterval(iv)
+    const tick = () => setLabel(ageLabel(startMs, Date.now()))
+    const iv = setInterval(tick, 1000)
+    // Re-tick on tab focus so a card hidden for 30s doesn't still read
+    // "12s ago" until the next 1s interval boundary.
+    const offVisible = onVisible(tick)
+    return () => {
+      clearInterval(iv)
+      offVisible()
+    }
   }, [startMs, closedAt])
   if (!startMs) return null
   return <span>{label}</span>

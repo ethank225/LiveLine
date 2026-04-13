@@ -63,6 +63,7 @@ from pykalshi import (
     OrderbookManager,
     OrderbookSnapshotMessage,
     OrderbookDeltaMessage,
+    OrderStatus,
     RateLimiter,
     Action,
     Side,
@@ -447,6 +448,7 @@ class KalshiManager:
         price: float | None = None,
         time_in_force: str = "gtc",
         use_demo: bool = False,
+        client_order_id: str | None = None,
     ) -> dict:
         """
         Place an order on Kalshi.
@@ -458,6 +460,10 @@ class KalshiManager:
             price: limit price in dollars (e.g. 0.45). None for market-like orders.
             time_in_force: "gtc", "ioc", or "fok"
             use_demo: route to demo account (for dry-run mode)
+            client_order_id: optional idempotency key — LiveLine tags every
+                order with "liveline-<trade_id[:8]>" so startup cleanup can
+                distinguish our orders from other Kalshi activity on the
+                same account and only cancel ours.
         """
         client = self._account_client(use_demo)
         if not client:
@@ -478,6 +484,8 @@ class KalshiManager:
             "count_fp": f"{quantity:.2f}",
             "time_in_force": _tif,
         }
+        if client_order_id is not None:
+            kwargs["client_order_id"] = client_order_id
         if price is not None:
             if side == "YES":
                 kwargs["yes_price_dollars"] = f"{price:.2f}"
@@ -593,6 +601,46 @@ class KalshiManager:
         except Exception as e:
             logger.error(f"Failed to fetch balance ({'demo' if use_demo else 'prod'}): {e}")
             return empty
+
+    def get_open_orders(self, use_demo: bool = False) -> list[dict]:
+        """Fetch every resting order on the selected account.
+
+        Used by the startup cleanup to find orphaned LiveLine orders
+        (client_order_id starts with `liveline-`). Returns dicts keyed
+        to what cleanup actually needs — the pykalshi Order object
+        doesn't expose client_order_id as a property, so we reach into
+        `order.data` defensively."""
+        client = self._account_client(use_demo)
+        if not client:
+            return []
+        try:
+            raw = list(client.portfolio.get_orders(
+                status=OrderStatus.RESTING,
+                fetch_all=True,
+            ))
+        except Exception as e:
+            logger.error(f"Failed to fetch open orders: {e}")
+            return []
+
+        out: list[dict] = []
+        for o in raw:
+            # client_order_id lives on the pydantic model, not the wrapper.
+            coid = None
+            try:
+                coid = getattr(o, "client_order_id", None)
+            except Exception:
+                pass
+            if coid is None:
+                data = getattr(o, "data", None)
+                if data is not None:
+                    coid = getattr(data, "client_order_id", None)
+            out.append({
+                "order_id": getattr(o, "order_id", None),
+                "ticker": getattr(o, "ticker", None),
+                "status": str(getattr(o, "status", "unknown")).split(".")[-1].lower(),
+                "client_order_id": coid,
+            })
+        return out
 
     def get_live_positions(self, use_demo: bool = False) -> list[dict]:
         """Fetch current open positions from Kalshi (demo or prod)."""

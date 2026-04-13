@@ -489,6 +489,18 @@ class Trade:
         """Compact form of the market ticker for logs (e.g. ML-CLE)."""
         return _short_ticker(self.market_ticker)
 
+    def _coid(self, leg: str) -> str:
+        """Idempotency key sent to Kalshi on every order we place.
+
+        Format: `liveline-<trade_id[:8]>-<leg>` where leg is `b` (IOC
+        buy), `s` (resting sell), or `x` (IOC force-exit). All three
+        share the `liveline-` prefix so startup cleanup can cancel only
+        our orders without touching any other Kalshi activity on the
+        same account. The `-<leg>` suffix keeps each order's key unique
+        so Kalshi's idempotency guard doesn't reject a later leg of the
+        same trade as a duplicate of an earlier one."""
+        return f"liveline-{self.id[:8]}-{leg}"
+
     # -- Lifecycle ----------------------------------------------------------
 
     def execute(self) -> "Trade":
@@ -565,6 +577,7 @@ class Trade:
             price=buy_price,
             time_in_force="ioc",
             dry_run=dry_run,
+            client_order_id=self._coid("b"),
         )
         self.buy_order_id = buy_result.get("order_id")
 
@@ -641,6 +654,7 @@ class Trade:
                 price=self.sell_target,
                 time_in_force="gtc",
                 dry_run=dry_run,
+                client_order_id=self._coid("s"),
             )
             self.sell_order_id = sell_result.get("order_id")
             logger.info(
@@ -899,6 +913,7 @@ class Trade:
                 price=limit_price,
                 time_in_force="ioc",
                 dry_run=dry_run,
+                client_order_id=self._coid("x"),
             )
         except Exception as e:
             logger.error(f"{self._log_prefix} EXIT IOC sell failed: {e}")
@@ -1433,6 +1448,92 @@ def check_stop_losses(market_ticker: str, prices: dict):
                 continue
             bid = prices["yes_bid"] if t.side == "YES" else prices["no_bid"]
             t.on_price_tick(bid)
+
+
+# ---------------------------------------------------------------------------
+# Startup cleanup
+# ---------------------------------------------------------------------------
+
+LIVELINE_COID_PREFIX = "liveline-"
+_MLB_TICKER_MARKER = "KXMLB"
+
+
+def cleanup_orphaned_liveline_orders() -> dict:
+    """Called once at startup (after kalshi.connect()). Two jobs:
+
+      1. Cancel every resting order whose client_order_id starts with
+         `liveline-`. These are orders LiveLine placed before a crash/
+         restart; the in-memory Trade objects that were tracking them
+         are gone, so they're unmanaged. Only our orders are touched —
+         the prefix filter means any other Kalshi activity on the same
+         account (hand-placed trades, other tools) is left alone.
+      2. Warn about any open MLB position. Kalshi doesn't tag positions
+         with the order that created them, so we can't tell which ones
+         are ours. Flatten-on-startup would be dangerous (could sell
+         someone else's position); instead we log loudly so the operator
+         can reconcile manually.
+
+    Returns a summary dict for logging / tests. Never raises — startup
+    must proceed even if Kalshi is flaky."""
+    summary = {"orders_canceled": 0, "orders_failed": 0, "positions_flagged": 0}
+
+    # --- orders ---
+    try:
+        orders = kalshi.get_open_orders(use_demo=False)
+    except Exception as e:
+        logger.error(f"[STARTUP] Failed to list open orders: {e}")
+        orders = []
+
+    for o in orders:
+        coid = o.get("client_order_id") or ""
+        if not coid.startswith(LIVELINE_COID_PREFIX):
+            continue
+        order_id = o.get("order_id")
+        ticker = o.get("ticker")
+        logger.warning(
+            f"[STARTUP] Orphaned LiveLine order: {order_id} "
+            f"coid={coid} ticker={ticker} — cancelling"
+        )
+        try:
+            kalshi.cancel_order(order_id)
+            summary["orders_canceled"] += 1
+        except Exception as e:
+            # 404 = order already gone (filled / canceled during the gap).
+            # Anything else is real — log it but keep going.
+            msg = str(e).lower()
+            if "not_found" in msg or "404" in msg:
+                logger.info(f"[STARTUP] Order {order_id} already gone (404)")
+                continue
+            summary["orders_failed"] += 1
+            logger.error(f"[STARTUP] Failed to cancel {order_id}: {e}")
+
+    # --- positions ---
+    try:
+        positions = kalshi.get_live_positions(use_demo=False)
+    except Exception as e:
+        logger.error(f"[STARTUP] Failed to list positions: {e}")
+        positions = []
+
+    for pos in positions:
+        ticker = pos.get("market_ticker") or ""
+        qty = int(pos.get("quantity", 0) or 0)
+        if qty == 0:
+            continue
+        if _MLB_TICKER_MARKER not in ticker:
+            continue
+        summary["positions_flagged"] += 1
+        logger.warning(
+            f"[STARTUP] Open MLB position: {ticker} qty={qty} — "
+            f"manual review recommended (not auto-selling; "
+            f"can't distinguish LiveLine from hand-placed positions)"
+        )
+
+    logger.info(
+        f"[STARTUP] Cleanup complete: canceled={summary['orders_canceled']} "
+        f"failed={summary['orders_failed']} "
+        f"positions_flagged={summary['positions_flagged']}"
+    )
+    return summary
 
 
 def close_and_flush_sessions_for_game(game_id: int) -> None:
