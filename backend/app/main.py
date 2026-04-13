@@ -61,7 +61,9 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("pykalshi").setLevel(logging.WARNING)
-logging.getLogger("app.market_selector").setLevel(logging.INFO)
+# Market selector: silence the per-tick eval/pick/delta-table logs.
+# Only trade-lifecycle status changes (from app.trader) come through.
+logging.getLogger("app.market_selector").setLevel(logging.WARNING)
 
 
 class _QuietAccessLogFilter(logging.Filter):

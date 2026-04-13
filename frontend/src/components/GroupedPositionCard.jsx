@@ -158,7 +158,7 @@ function SubRowInner({ position }) {
   const effective = (isPending && isOpen) ? 'pending_exit' : status
   const cfg = STATUS_CONFIG[effective] || STATUS_CONFIG.open
 
-  const title = betLabel(position) || position.market_ticker
+  const title = position.display_label || betLabel(position) || position.market_ticker
   const entryC = formatCents(position.entry_price)
   const targetC = formatCents(position.sell_target)
 

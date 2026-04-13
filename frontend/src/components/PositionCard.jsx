@@ -59,7 +59,7 @@ function PositionCard({ position }) {
   const cfg = STATUS_CONFIG[effective] || STATUS_CONFIG.open
 
   const eventLabel = position.event || ''
-  const marketLabel = betLabel(position) || position.market_ticker || ''
+  const marketLabel = position.display_label || betLabel(position) || position.market_ticker || ''
   const entryC = formatCents(position.entry_price)
   const targetC = formatCents(position.sell_target)
 

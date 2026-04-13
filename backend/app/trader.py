@@ -103,30 +103,34 @@ def _cancel_order(order_id: str, *, dry_run: bool) -> dict:
     return kalshi.cancel_order(order_id)
 
 
-def _actual_fill(response: dict, action: str = "buy") -> tuple[float, int] | None:
+def _actual_fill(
+    response: dict,
+    action: str = "buy",
+    side: str = "YES",
+) -> tuple[float, int] | None:
     """Return `(per_contract_price, filled_qty)` from a Kalshi order
     response, or `None` if the order did not fill.
 
-    Kalshi's `/portfolio/orders` POST returns totals for the order:
-      - `fill_count_fp`            → total contracts filled (string, "2.00")
-      - `taker_fill_cost_dollars`  → total dollars paid as taker (string, "0.62")
-    Dividing recovers the per-contract VWAP. Using the limit price
-    instead would over-report losses on a winning IOC exit by ~40-60¢
-    per contract.
+    Buys: use `taker_fill_cost_dollars / fill_count_fp` (VWAP across
+    filled levels), which matches what we actually paid on the bought
+    side.
 
-    For sells, `taker_fill_cost_dollars` reports the complementary-side
-    cost (e.g. NO cost when selling YES), not the revenue. Invert via
-    `1.00 - per_contract` so the caller gets the price actually received.
+    Sells: `taker_fill_cost_dollars` semantics aren't reliable across
+    YES vs. NO sells, so read `yes_price_dollars` from the response
+    instead. Kalshi always echoes it, and it's unambiguous:
+      - SELL YES → revenue = yes_price_dollars
+      - SELL NO  → revenue = 1.00 - yes_price_dollars
 
-    Logs every field we read so a schema-drift bug (e.g. Kalshi moving
-    to per-contract cost) is visible in prod without new instrumentation.
-
-    Dry-run / simulated responses don't carry cost info and return None."""
+    Logs every field we read so a schema-drift bug is visible in prod
+    without new instrumentation. Dry-run / simulated responses don't
+    carry fill data and return None.
+    """
     if not isinstance(response, dict):
         return None
     qty_raw = response.get("fill_count_fp")
     cost_raw_taker = response.get("taker_fill_cost_dollars")
     cost_raw_maker = response.get("maker_fill_cost_dollars")
+    yes_price_raw = response.get("yes_price_dollars")
     order_id = response.get("order_id")
 
     if qty_raw is None:
@@ -138,6 +142,26 @@ def _actual_fill(response: dict, action: str = "buy") -> tuple[float, int] | Non
     if qty <= 0:
         return None
 
+    if action == "sell":
+        if yes_price_raw is None:
+            logger.error(
+                f"[kalshi] _actual_fill sell order_id={order_id} missing "
+                f"yes_price_dollars in response; cannot derive exit price"
+            )
+            return None
+        try:
+            yes_price = float(yes_price_raw)
+        except (TypeError, ValueError):
+            return None
+        per_contract = round(yes_price if side == "YES" else 1.0 - yes_price, 4)
+        logger.debug(
+            f"[kalshi] _actual_fill order_id={order_id} action=sell side={side} "
+            f"fill_count_fp={qty_raw!r} yes_price_dollars={yes_price_raw!r} "
+            f"→ qty={qty} per_contract=${per_contract:.4f}"
+        )
+        return (per_contract, qty)
+
+    # --- buy path (unchanged): VWAP via taker_fill_cost_dollars / qty ---
     cost_raw = cost_raw_taker if cost_raw_taker is not None else cost_raw_maker
     if cost_raw is None:
         return None
@@ -147,8 +171,8 @@ def _actual_fill(response: dict, action: str = "buy") -> tuple[float, int] | Non
         return None
 
     per_contract = round(cost / qty, 4)
-    logger.info(
-        f"[kalshi] _actual_fill order_id={order_id} action={action} "
+    logger.debug(
+        f"[kalshi] _actual_fill order_id={order_id} action=buy side={side} "
         f"fill_count_fp={qty_raw!r} "
         f"taker_fill_cost_dollars={cost_raw_taker!r} "
         f"maker_fill_cost_dollars={cost_raw_maker!r} "
@@ -164,14 +188,7 @@ def _actual_fill(response: dict, action: str = "buy") -> tuple[float, int] | Non
             f"[0.01, 0.99] — assuming taker_fill_cost_dollars is already "
             f"per-contract. Using ${cost:.4f} as fill price."
         )
-        raw = round(cost, 4)
-        if action == "sell":
-            raw = round(1.00 - raw, 4)
-        return (raw, qty)
-    if action == "sell":
-        # taker_fill_cost_dollars on a sell is the complementary-side
-        # cost; revenue per contract = 1 - that.
-        per_contract = round(1.00 - per_contract, 4)
+        return (round(cost, 4), qty)
     return (per_contract, qty)
 
 
@@ -461,6 +478,19 @@ class Trade:
                 current_price = prices["yes_bid"] if self.side == "YES" else prices["no_bid"]
             except Exception:
                 pass
+        # Late import: trader → market_selector → trader would cycle at
+        # module load; deferring to call time keeps the graph clean.
+        from app.market_selector import _game_teams, _teams_lock
+        from app.bet_label import compute_display_label
+        with _teams_lock:
+            home_abbr, away_abbr = _game_teams.get(self.game_id, ("", ""))
+        display_label = compute_display_label(
+            market_ticker=self.market_ticker,
+            side=self.side,
+            market_type=self.market_type,
+            home_abbr=home_abbr,
+            away_abbr=away_abbr,
+        )
         return {
             # Dual id for backward compat — some frontend code reads `id`,
             # some reads `position_id`.
@@ -472,6 +502,9 @@ class Trade:
             "market_title": self.market_title,
             "market_type": self.market_type,
             "side": self.side,
+            "home_abbr": home_abbr,
+            "away_abbr": away_abbr,
+            "display_label": display_label,
             "entry_price": self.entry_price,
             "quantity": self.quantity,
             "sell_target": self.sell_target,
@@ -949,7 +982,7 @@ class Trade:
             )
             return exit_price
 
-        fill = _actual_fill(response, action="sell")
+        fill = _actual_fill(response, action="sell", side=self.side)
         if fill is None:
             # IOC returned no fills — no bids at ≥$0.01 (very rare). Use
             # the fallback / current bid so P&L still reflects something.

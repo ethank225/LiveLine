@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, memo } from 'react'
 import { betLabel as buildBetLabel } from '../utils/betLabel'
 
 function priceInfo(trade) {
-  const label = buildBetLabel(trade)
+  const label = trade.display_label || buildBetLabel(trade)
   if (!label) return null
   const entry = trade.entry_price ?? 0
   const target = trade.sell_target ?? 0

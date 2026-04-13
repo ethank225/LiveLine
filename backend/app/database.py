@@ -349,20 +349,36 @@ def get_game_history(user_id: str, game_id: int) -> list[dict]:
         logger.error(f"get_game_history failed (user={user_id} game={game_id}): {e}")
         return []
 
+    # Late import: database module is imported by market_selector at load.
+    from app.market_selector import _game_teams, _teams_lock
+    from app.bet_label import compute_display_label
+
     out: list[dict] = []
     for r in rows:
+        gid = r.get("game_id")
+        with _teams_lock:
+            home_abbr, away_abbr = _game_teams.get(gid, ("", ""))
+        ticker = r.get("market_ticker") or ""
+        side = r.get("side") or ""
+        mtype = r.get("market_type")
         out.append({
             # Dual id to match to_dict's shape — frontend keys on id/position_id.
             "id": r.get("id"),
             "position_id": r.get("id"),
             "trade_db_id": r.get("id"),
-            "game_id": r.get("game_id"),
+            "game_id": gid,
             # Frontend uses `event`, DB column is `event_type`.
             "event": r.get("event_type"),
-            "market_ticker": r.get("market_ticker"),
+            "market_ticker": ticker,
             "market_title": r.get("market_label"),
-            "market_type": r.get("market_type"),
-            "side": r.get("side"),
+            "market_type": mtype,
+            "side": side,
+            "home_abbr": home_abbr,
+            "away_abbr": away_abbr,
+            "display_label": compute_display_label(
+                market_ticker=ticker, side=side, market_type=mtype,
+                home_abbr=home_abbr, away_abbr=away_abbr,
+            ),
             "entry_price": _as_float(r.get("entry_price")),
             "sell_target": _as_float(r.get("sell_target")),
             "quantity": r.get("quantity") or 0,

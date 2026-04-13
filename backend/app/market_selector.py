@@ -31,6 +31,7 @@ from app.constants import (
     BLOWOUT_THRESHOLD, STOP_LOSS_CENTS,
 )
 from app import database as db
+from app.bet_label import compute_display_label
 from app.engine import EventDelta
 from app.kalshi_client import kalshi
 from app.line_selection import pick_ou_line, pick_spread_line
@@ -439,6 +440,8 @@ def _evaluate_market(
     alpha: float,
     bet_size: int,
     event: str | None = None,
+    home_abbr: str = "",
+    away_abbr: str = "",
 ) -> dict | None:
     """Evaluate a single market for one event. Returns trade info or None."""
     prices = kalshi.get_prices(market.ticker)
@@ -453,6 +456,14 @@ def _evaluate_market(
     # the away-side contract. The flip flag handles this.
     d = -delta_value if market.flip else delta_value
 
+    yes_label = compute_display_label(
+        market_ticker=market.ticker, side="YES", market_type=market.market_type,
+        home_abbr=home_abbr, away_abbr=away_abbr,
+    )
+    no_label = compute_display_label(
+        market_ticker=market.ticker, side="NO", market_type=market.market_type,
+        home_abbr=home_abbr, away_abbr=away_abbr,
+    )
     prefix = f"eval[{event or '-'}][{market.label}]"
     logger.info(
         f"{prefix} delta_in={delta_value:+.4f} d_eff={d:+.4f} flip={market.flip} "
@@ -531,15 +542,17 @@ def _evaluate_market(
     elif d < 0:
         no_reason = f"skipped: no no prices (bid={no_bid} ask={no_ask})"
 
-    logger.info(f"{prefix}   YES {yes_reason}")
-    logger.info(f"{prefix}   NO  {no_reason}")
+    logger.info(f"{prefix}   YES ({yes_label}) {yes_reason}")
+    logger.info(f"{prefix}   NO  ({no_label}) {no_reason}")
 
     if best is None:
         logger.info(f"{prefix} → no trade")
         return None
+    picked_label = yes_label if best["side"] == "YES" else no_label
     logger.info(
-        f"{prefix} → trade side={best['side']} entry={best['entry_price']} "
-        f"target={best['sell_target']} ev={best['ev_per_contract']:+.4f}"
+        f"{prefix} → trade {picked_label} ({best['side']}) "
+        f"entry={best['entry_price']} target={best['sell_target']} "
+        f"ev={best['ev_per_contract']:+.4f}"
     )
 
     return {
@@ -677,7 +690,7 @@ def compute_best_trades(
         # --- Moneyline candidates ---
         if not (blowout_filter and is_blowout):
             for ml in ml_markets:
-                trade = _evaluate_market(ml, d.delta, alpha, bet_size, event=d.event)
+                trade = _evaluate_market(ml, d.delta, alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr)
                 if trade:
                     candidates.append(trade)
 
@@ -685,7 +698,7 @@ def compute_best_trades(
         if ou_market:
             ou_delta_data = d.over_under.get(str(ou_market.line))
             if ou_delta_data:
-                trade = _evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event)
+                trade = _evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr)
                 if trade:
                     candidates.append(trade)
 
@@ -693,7 +706,7 @@ def compute_best_trades(
         for sp_market in sp_markets_picked:
             sp_delta_data = d.spread.get(str(sp_market.line))
             if sp_delta_data:
-                trade = _evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event)
+                trade = _evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr)
                 if trade:
                     candidates.append(trade)
 
@@ -705,10 +718,29 @@ def compute_best_trades(
             best_trade["active"] = best_trade["ev_per_contract"] > 0
             best_trade["home_abbr"] = home_abbr
             best_trade["away_abbr"] = away_abbr
+            best_trade["display_label"] = compute_display_label(
+                market_ticker=best_trade["market_ticker"],
+                side=best_trade["side"],
+                market_type=best_trade["market_type"],
+                home_abbr=home_abbr,
+                away_abbr=away_abbr,
+            )
             # all_trades is the full positive-EV basket. Frontend ignores
             # it in single-market mode; backend reads it in multi mode.
             best_trade["all_trades"] = [
-                {**c, "event": d.event, "home_abbr": home_abbr, "away_abbr": away_abbr}
+                {
+                    **c,
+                    "event": d.event,
+                    "home_abbr": home_abbr,
+                    "away_abbr": away_abbr,
+                    "display_label": compute_display_label(
+                        market_ticker=c["market_ticker"],
+                        side=c["side"],
+                        market_type=c["market_type"],
+                        home_abbr=home_abbr,
+                        away_abbr=away_abbr,
+                    ),
+                }
                 for c in candidates
                 if c["ev_per_contract"] > 0
             ]
@@ -726,7 +758,8 @@ def compute_best_trades(
             _seen_trade_ids[id(best_trade)] = d.event
             logger.info(
                 f"  picked {d.event:<3} → {best_trade['market_type']:<10} "
-                f"{best_trade['side']} {best_trade['market_ticker']} "
+                f"{best_trade.get('display_label', '')} ({best_trade['side']}) "
+                f"{best_trade['market_ticker']} "
                 f"entry={best_trade['entry_price']:.2f} "
                 f"target={best_trade['sell_target']:.2f} "
                 f"ev={best_trade['ev_per_contract']:+.4f} "
