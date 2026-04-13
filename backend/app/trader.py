@@ -236,6 +236,11 @@ def _get_fill_count(order_id: str | None) -> int:
 
 _sessions: dict[tuple[str, int], "Session"] = {}
 _trade_index: dict[str, "Trade"] = {}
+# Parallel index keyed by the resting limit-sell's Kalshi order_id. Lets
+# the websocket `fill` dispatcher find the owning Trade in O(1) without
+# scanning every session. Populated when _activate() places the sell;
+# cleared on terminal transition via _notify_resolved().
+_trade_by_sell_order_id: dict[str, "Trade"] = {}
 _registry_lock = threading.Lock()
 
 # Tickers with an in-flight (non-terminal) trade. Guards against
@@ -657,6 +662,11 @@ class Trade:
                 client_order_id=self._coid("s"),
             )
             self.sell_order_id = sell_result.get("order_id")
+            if self.sell_order_id:
+                # Index for the websocket fill dispatcher. Unregistered
+                # in _notify_resolved on any terminal transition.
+                with _registry_lock:
+                    _trade_by_sell_order_id[self.sell_order_id] = self
             logger.info(
                 f"{self._log_prefix} SELL {self.quantity} {self.side} {self._short} "
                 f"@${self.sell_target:.2f} → resting"
@@ -962,21 +972,54 @@ class Trade:
 
     def _mark_filled_at_target(self) -> None:
         """Finalize the trade as 'filled' at sell_target. Used when we
-        detect the limit sell already executed on Kalshi."""
-        if self._clean_timer:
-            self._clean_timer.cancel()
+        detect the limit sell already executed on Kalshi.
+
+        Reachable from three threads now: the clean-window timer, the
+        price-tick probe, and the websocket fill dispatcher. The first
+        lock-holder wins via CAS (status must be 'open' to transition);
+        any racing callers no-op. All side effects (timer cancel, DB
+        write, SSE notify) happen OUTSIDE the lock to avoid deadlocks —
+        _notify_resolved takes _registry_lock / _active_tickers_lock,
+        and nesting those inside self._lock would invert the acquisition
+        order used elsewhere.
+        """
         exit_price = self.sell_target
         with self._lock:
+            if self.status != "open":
+                # Another path (timer / stop-loss / websocket) already
+                # claimed the transition. No-op.
+                return
             self.status = "filled"
             self.realized_pnl = round((exit_price - self.entry_price) * self.quantity, 2)
             self.exit_price = exit_price
             self.completed_at = datetime.utcnow()
+        # Lock released — safe to do side-effects that may take other locks.
+        if self._clean_timer:
+            self._clean_timer.cancel()
         logger.info(
             f"{self._log_prefix} RESOLVED filled pnl={_fmt_pnl(self.realized_pnl)} "
             f"(qty={self.quantity} @${exit_price:.2f})"
         )
         self._update_db_status("filled", exit_price, self.realized_pnl)
         self._notify_resolved()
+
+    def on_websocket_fill(self, msg) -> None:
+        """Called from the Kalshi feed thread when a private fill message
+        arrives whose order_id matches our resting sell. The cheap
+        pre-check here avoids a log line when we're already resolved;
+        the authoritative guard is the status-CAS inside
+        _mark_filled_at_target.
+        """
+        oid = getattr(msg, "order_id", None)
+        if not oid or oid != self.sell_order_id:
+            return
+        with self._lock:
+            if self.status != "open":
+                return
+        logger.info(
+            f"{self._log_prefix} FILL ws-detected order_id={oid}"
+        )
+        self._mark_filled_at_target()
 
     # -- Safety net --------------------------------------------------------
 
@@ -1050,6 +1093,13 @@ class Trade:
             with _active_tickers_lock:
                 _active_tickers.discard(self.market_ticker)
             self._owns_ticker_claim = False
+
+        # Drop the websocket-fill index entry. pop(..., None) is safe
+        # if another path already removed it (double-resolve race) or
+        # the sell never placed (error path, sell_order_id still None).
+        if self.sell_order_id:
+            with _registry_lock:
+                _trade_by_sell_order_id.pop(self.sell_order_id, None)
 
         with _registry_lock:
             session = _sessions.get((self.user_id, self.game_id)) if self.user_id else None
@@ -1428,6 +1478,33 @@ def cancel_position(position_id: str) -> dict:
 
     # Single-trade path (raises ValueError if past undo window).
     return trade.cancel()
+
+
+def dispatch_websocket_fill(msg):
+    """Websocket fill handler. Called on the Kalshi feed thread for every
+    private fill event on the account. Looks up the owning Trade by the
+    message's order_id and routes to Trade.on_websocket_fill.
+
+    Must not raise: the feed listener runs every registered handler in a
+    tight loop and an uncaught exception here could interfere with
+    sibling handlers or be logged at a confusing site. All errors are
+    swallowed and logged locally.
+    """
+    try:
+        if msg is None:
+            return
+        oid = getattr(msg, "order_id", None)
+        if not oid:
+            return
+        with _registry_lock:
+            trade = _trade_by_sell_order_id.get(oid)
+        if trade is None:
+            # Not one of ours (our buy fill, someone else's demo account,
+            # or a stale fill after we already resolved the trade).
+            return
+        trade.on_websocket_fill(msg)
+    except Exception as e:
+        logger.error(f"dispatch_websocket_fill: {e}")
 
 
 def check_stop_losses(market_ticker: str, prices: dict):

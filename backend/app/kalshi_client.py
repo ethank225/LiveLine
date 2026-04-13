@@ -88,6 +88,7 @@ class KalshiManager:
         self._subscribed: set[str] = set()
         self._lock = threading.Lock()
         self._tick_callbacks: list[Callable] = []
+        self._fill_callbacks: list[Callable] = []
         self._connected = False
 
     @property
@@ -142,7 +143,20 @@ class KalshiManager:
         self.feed = self.client.feed()
         self.feed.on("ticker", self._on_ticker)
         self.feed.on("orderbook_delta", self._on_orderbook)
+        # Private user-scoped channel: instant notification when our own
+        # orders fill. Drives real-time UI state (see trader.py
+        # dispatch_websocket_fill) instead of waiting on the clean-window
+        # timer or tick-based polling.
+        self.feed.on("fill", self._on_fill)
         self.feed.start()
+        try:
+            # No market_ticker — "fill" is a private per-user channel.
+            self.feed.subscribe("fill")
+            logger.info("Subscribed to private fill channel")
+        except Exception as e:
+            # Don't hard-fail on connect if the fill channel isn't
+            # available; the timer / tick fallbacks still resolve trades.
+            logger.warning(f"Failed to subscribe to fill channel: {e}")
         self._connected = True
 
         env_label = "demo" if demo else "PRODUCTION"
@@ -185,6 +199,15 @@ class KalshiManager:
         """Register a callback for price updates: fn(market_ticker, prices_dict)."""
         self._tick_callbacks.append(callback)
 
+    def on_fill(self, callback: Callable[[object], None]):
+        """Register a callback for private fill events: fn(FillMessage).
+
+        Callbacks fire on the feed thread — same thread as on_tick. Each
+        callback is wrapped in try/except so one bad handler can't break
+        the others (or the feed listener).
+        """
+        self._fill_callbacks.append(callback)
+
     def _on_ticker(self, msg):
         """Handle incoming websocket ticker messages."""
         ticker = msg.market_ticker
@@ -202,6 +225,14 @@ class KalshiManager:
                 cb(ticker, prices)
             except Exception as e:
                 logger.error(f"Tick callback error: {e}")
+
+    def _on_fill(self, msg):
+        """Handle incoming private fill messages (our own orders)."""
+        for cb in self._fill_callbacks:
+            try:
+                cb(msg)
+            except Exception as e:
+                logger.error(f"Fill callback error: {e}")
 
     def _on_orderbook(self, msg):
         """Handle orderbook snapshot and delta messages."""

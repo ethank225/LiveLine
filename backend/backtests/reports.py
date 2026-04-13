@@ -119,15 +119,16 @@ def print_accuracy_summary(synced):
         items = by_market.get(mt)
         if not items:
             continue
-        labels = sorted(set(s.get("market_label", "") for s in items))
-        label_str = ", ".join(labels)
+        n_markets = len(set(s.get("market_ticker", "") for s in items
+                             if s.get("market_ticker")))
+        noun = "dynamic lines" if mt == "over_under" else "markets"
         if mt == "over_under":
             filtered = [s for s in items if s.get("is_high_lev_ou")]
             filter_desc = f"total within {HIGH_LEV_OU_PROXIMITY} of line"
         else:
             filtered = [s for s in items if s.get("is_high_lev_ml")]
             filter_desc = f"|delta| >= {HIGH_LEV_ML_THRESHOLD}"
-        print(f"\n{mt.upper()} — ALL ({label_str})")
+        print(f"\n{mt.upper()} — ALL ({n_markets} {noun})")
         _accuracy_block(items)
         if filtered:
             print(f"\n{mt.upper()} — HIGH LEVERAGE ({len(filtered)} plays, {filter_desc})")
@@ -187,7 +188,13 @@ def _timing_block(items, label):
         if not pct_stats:
             continue
 
-        peak_label = max(pct_stats, key=lambda k: abs(pct_stats[k]["avg"]))
+        # Peak is directional: max positive for up-predictions, min (most
+        # negative) for down-predictions. Using abs() here collapses the two
+        # and can mis-label a bucket where price moved the wrong way as "peak".
+        if pred_avg >= 0:
+            peak_label = max(pct_stats, key=lambda k: pct_stats[k]["avg"])
+        else:
+            peak_label = min(pct_stats, key=lambda k: pct_stats[k]["avg"])
         peak_val = pct_stats[peak_label]["avg"]
         peak_abs = abs(peak_val)
 
@@ -244,7 +251,9 @@ def print_timing_analysis(synced):
         items = by_market.get(mt)
         if not items:
             continue
-        labels = sorted(set(s.get("market_label", "") for s in items))
+        n_markets = len(set(s.get("market_ticker", "") for s in items
+                             if s.get("market_ticker")))
+        noun = "dynamic lines" if mt == "over_under" else "markets"
         if mt == "over_under":
             filtered = [s for s in items if s.get("is_high_lev_ou")]
             filter_desc = f"total within {HIGH_LEV_OU_PROXIMITY} of line"
@@ -252,7 +261,7 @@ def print_timing_analysis(synced):
             filtered = [s for s in items if s.get("is_high_lev_ml")]
             filter_desc = f"|delta| >= {HIGH_LEV_ML_THRESHOLD}"
         print(f"\n{'=' * 70}")
-        print(f"{mt.upper()} — ALL ({', '.join(labels)})")
+        print(f"{mt.upper()} — ALL ({n_markets} {noun})")
         _timing_block(items, mt)
         if filtered:
             print(f"\n{'=' * 70}")

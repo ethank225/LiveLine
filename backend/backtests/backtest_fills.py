@@ -26,6 +26,7 @@ from backtests.constants import (
     WINDOW_PCTS, WINDOW_LABELS, CONTRACTS,
     get_clean_window,
 )
+from backtests.report_io import capture_report
 
 RESULTS_DIR = Path(__file__).parent / "results"
 
@@ -285,6 +286,12 @@ def print_fill_time_distribution(plays: list[dict], alpha: float):
 # ---------------------------------------------------------------------------
 
 def main():
+    with capture_report("backtest_fills") as report_path:
+        _main_inner()
+        print(f"\nReport saved: {report_path}")
+
+
+def _main_inner():
     parser = argparse.ArgumentParser(
         description="Analyze limit-order fill simulation from backtest CSVs")
     parser.add_argument("--results-dir", type=str, default=str(RESULTS_DIR),

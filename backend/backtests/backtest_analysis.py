@@ -15,7 +15,12 @@ Usage:
 import argparse
 import csv
 import glob
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from backtests.report_io import capture_report
 
 RESULTS_DIR = Path(__file__).parent / "results"
 
@@ -359,6 +364,12 @@ def print_pnl_simulation(rows: list[dict]):
 # ---------------------------------------------------------------------------
 
 def main():
+    with capture_report("backtest_analysis") as report_path:
+        _main_inner()
+        print(f"\nReport saved: {report_path}")
+
+
+def _main_inner():
     parser = argparse.ArgumentParser(
         description="Analyze backtest results from synced CSV files")
     parser.add_argument("--results-dir", type=str,

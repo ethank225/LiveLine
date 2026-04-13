@@ -44,6 +44,7 @@ from app.trader import (
     TradeGroup,
     cancel_position,
     check_stop_losses,
+    dispatch_websocket_fill,
     cleanup_orphaned_liveline_orders,
     execute_trade,
     find_trade,
@@ -100,6 +101,10 @@ async def lifespan(app: FastAPI):
         kalshi.connect()
         kalshi.on_tick(on_price_update)
         kalshi.on_tick(check_stop_losses)
+        # Push-based fill detection. Without this, trades only transition
+        # to 'filled' via the 45s clean-window timer or the bid-crossing
+        # tick probe — both of which can lag the actual Kalshi execution.
+        kalshi.on_fill(dispatch_websocket_fill)
         logger.info("Kalshi integration active")
         # Reconcile orphaned state from a prior crash: cancel any resting
         # LiveLine-tagged orders (safe — prefix filter won't touch other
@@ -769,6 +774,45 @@ async def debug_simulate_fill(
     # Run off the event loop — _mark_filled_at_target writes to Supabase
     # and pushes SSE, neither of which should block the async thread.
     await asyncio.to_thread(trade._mark_filled_at_target)
+    return {
+        "position_id": trade.id,
+        "status": trade.status,
+        "exit_price": trade.exit_price,
+        "realized_pnl": trade.realized_pnl,
+    }
+
+
+@app.post("/debug/simulate-ws-fill/{trade_id}")
+async def debug_simulate_ws_fill(
+    trade_id: str,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Dry-run only. Route a fake fill through the same dispatcher the
+    real Kalshi websocket uses (dispatch_websocket_fill → index lookup →
+    Trade.on_websocket_fill → CAS → SSE push). Exercises the whole
+    push-based fill path end-to-end without needing a live exchange
+    event — the card in the UI should flip to 'filled' the moment this
+    endpoint returns.
+
+    Distinct from /debug/simulate-fill: that one jumps straight to
+    _mark_filled_at_target; this one proves the dispatcher wiring and
+    the _trade_by_sell_order_id index are correct. Status must be
+    'open' (sell_order_id is only set once the limit sell rests)."""
+    trade = find_trade(trade_id)
+    if (
+        trade is None
+        or trade.user_id != user.id
+        or not trade._settings.get("dry_run")
+        or trade.status != "open"
+        or not trade.sell_order_id
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    class _FakeFillMsg:
+        def __init__(self, order_id: str):
+            self.order_id = order_id
+
+    await asyncio.to_thread(dispatch_websocket_fill, _FakeFillMsg(trade.sell_order_id))
     return {
         "position_id": trade.id,
         "status": trade.status,

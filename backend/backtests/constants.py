@@ -6,7 +6,7 @@ backtest-only values.
 
 from app.constants import (  # noqa: F401 — re-export
     # Trading parameters
-    DEFAULT_ALPHA, ALPHAS, DEFAULT_BET_SIZE,
+    DEFAULT_ALPHA, ALPHAS, DEFAULT_BET_SIZE, DEFAULT_MAX_DOLLARS,
     CLEAN_WINDOW_SECONDS, UNDO_WINDOW_SECONDS,
     STOP_LOSS_CENTS, STOP_LEVELS,
     # Market lines

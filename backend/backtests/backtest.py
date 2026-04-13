@@ -22,7 +22,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backtests.mlb import get_games_for_date, pull_play_by_play
 from backtests.enrichment import enrich_with_model
-from backtests.constants import WINDOW_SECONDS, ENTRY_OFFSET
+from backtests.constants import (
+    WINDOW_SECONDS, ENTRY_OFFSET, DEFAULT_ALPHA, DEFAULT_MAX_DOLLARS, ALPHAS,
+)
 from backtests.kalshi_sync import (
     set_trace_mode, set_stop_loss_analysis,
     pull_kalshi_trades, sync_plays_with_trades,
@@ -34,10 +36,20 @@ from backtests.reports import (
     write_stop_loss_csv, print_flagged_summary,
     print_accuracy_summary, print_timing_analysis,
 )
-from backtests.output import save_csv, print_trace
+from backtests.output import save_csv, print_trace, OUTPUT_DIR
+from backtests.multi_market import (
+    run_comparison, print_comparison, write_trades_csv,
+)
+from backtests.report_io import capture_report, timestamped_path
 
 
 def main():
+    with capture_report("backtest") as report_path:
+        _main_inner()
+        print(f"\nReport saved: {report_path}")
+
+
+def _main_inner():
     parser = argparse.ArgumentParser(description="Backtest LiveLine engine against historical data")
     parser.add_argument("--date", type=str, default=None,
                         help="Single date (YYYY-MM-DD). Defaults to yesterday.")
@@ -59,7 +71,17 @@ def main():
                         help="Print walkthrough for the N highest-delta trades.")
     parser.add_argument("--stop-loss-analysis", action="store_true",
                         help="Run stop loss simulation across multiple levels.")
+    parser.add_argument("--multi-market", action="store_true",
+                        help="Run single-vs-multi-market comparison on the synced set.")
+    parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA,
+                        help=f"Alpha for single/multi-market comparison (default: {DEFAULT_ALPHA}).")
+    parser.add_argument("--max-dollars", type=float, default=DEFAULT_MAX_DOLLARS,
+                        help=f"Per-play budget for comparison (default: ${DEFAULT_MAX_DOLLARS:.0f}).")
     args = parser.parse_args()
+
+    if args.multi_market and args.alpha not in ALPHAS:
+        print(f"Warning: alpha={args.alpha} is not in simulated ALPHAS={ALPHAS}. "
+              f"Fill simulation will not have data for this alpha.")
 
     if args.trace:
         set_trace_mode(True)
@@ -202,6 +224,9 @@ def main():
 
                 if game_synced:
                     games_with_kalshi += 1
+                    game_tag = f"{game_id} {tag}"
+                    for r in game_synced:
+                        r["game_tag"] = game_tag
                     all_synced.extend(game_synced)
             else:
                 print(f"  [{tag}] {len(records)} plays (MLB only)")
@@ -220,9 +245,21 @@ def main():
         print_timing_analysis(all_synced)
         if args.stop_loss_analysis:
             print_stop_loss_analysis(all_synced)
-            from backtests.output import OUTPUT_DIR
-            write_stop_loss_csv(all_synced, OUTPUT_DIR / "stop_loss_events.csv")
+            sl_path = timestamped_path("stop_loss_events", "csv")
+            write_stop_loss_csv(all_synced, sl_path)
+            print(f"Saved stop-loss events: {sl_path}")
             print_flagged_summary(all_synced)
+        if args.multi_market:
+            single_trades, multi_trades = run_comparison(
+                all_synced, args.alpha, args.max_dollars)
+            print_comparison(single_trades, multi_trades,
+                             args.alpha, args.max_dollars)
+            single_path = timestamped_path("multi_market_single_trades", "csv")
+            multi_path = timestamped_path("multi_market_multi_trades", "csv")
+            write_trades_csv(single_trades, single_path)
+            write_trades_csv(multi_trades, multi_path)
+            print(f"\nSaved single-mode trades: {single_path}")
+            print(f"Saved multi-mode trades:  {multi_path}")
         if args.trace:
             print_trace(all_synced, args.trace)
     else:
