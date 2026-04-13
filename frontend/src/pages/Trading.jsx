@@ -213,6 +213,14 @@ export default function Trading() {
         } catch { /* ignore */ }
       })
 
+      // Backend pushes this whenever a trade reaches a terminal state
+      // (filled / expired / stopped / canceled). Without this, the card
+      // would stay in its active state until the next 60s /positions poll.
+      es.addEventListener('positions_update', () => {
+        fetchPositions()
+        fetchHistory()
+      })
+
       es.onerror = () => {
         es.close()
         sseRetries.current += 1
@@ -233,7 +241,7 @@ export default function Trading() {
       sseRef.current?.close()
       if (pollTimer) clearInterval(pollTimer)
     }
-  }, [gameId, triggerFlash, doRefresh, applyPositionPrices])
+  }, [gameId, triggerFlash, doRefresh, applyPositionPrices, fetchPositions, fetchHistory])
 
   // ---------------------------------------------------------------------------
   // Handlers

@@ -45,6 +45,38 @@ _TERMINAL_STATUSES = {"filled", "stopped", "expired", "canceled", "canceled_by_u
 
 
 # ---------------------------------------------------------------------------
+# Log-format helpers
+# ---------------------------------------------------------------------------
+
+def _short_ticker(ticker: str) -> str:
+    """Collapse Kalshi MLB tickers into a compact form for log lines.
+
+    Examples:
+        KXMLBGAME-26APR121920CLEATL-CLE    → ML-CLE
+        KXMLBTOTAL-26APR121610TEXLAD-8     → OU-8
+        KXMLBSPREAD-26APR121410CWSKC-KC2   → SP-KC2
+
+    Unknown tickers fall back to the raw string so nothing silently
+    loses identity in the logs."""
+    if not ticker:
+        return ticker
+    parts = ticker.split("-")
+    if len(parts) < 2:
+        return ticker
+    head = parts[0]
+    label = parts[-1]
+    if head.startswith("KXMLBGAME"):
+        return f"ML-{label}"
+    if head.startswith("KXMLBTOTAL"):
+        return f"OU-{label}"
+    if head.startswith("KXMLBSPREAD"):
+        return f"SP-{label}"
+    # Generic fallback — keep prefix-label for unfamiliar series so
+    # log readers can still eyeball the market.
+    return f"{head}-{label}"
+
+
+# ---------------------------------------------------------------------------
 # Order helpers
 #
 # dry_run is now passed as a kwarg (by Trade, which snapshots it from its
@@ -57,48 +89,141 @@ def _fake_order_id() -> str:
 
 
 def _place_order(*, dry_run: bool, **kwargs) -> dict:
-    """Place an order. In dry_run, simulate (log + fake full fill at ask)."""
+    """Place an order. Silent — callers handle the [TRADE ...] log line.
+    Raw POST body is captured by the client-level hook for diagnostics."""
     if dry_run:
-        oid = _fake_order_id()
-        logger.info(
-            f"[SIM] {kwargs.get('action','?').upper()} "
-            f"{kwargs.get('quantity',0)} {kwargs.get('side','?')} "
-            f"{kwargs.get('market_ticker','?')} "
-            f"@${kwargs.get('price',0):.2f} "
-            f"tif={kwargs.get('time_in_force','gtc')} → {oid}"
-        )
-        return {"order_id": oid, "status": "resting"}
+        return {"order_id": _fake_order_id(), "status": "resting"}
     return kalshi.place_order(**kwargs)
 
 
 def _cancel_order(order_id: str, *, dry_run: bool) -> dict:
-    """Cancel an order. In dry_run, just log it."""
+    """Cancel an order. Silent — callers handle the [TRADE ...] log line."""
     if dry_run:
-        logger.info(f"[SIM] CANCEL {order_id}")
         return {"order_id": order_id, "status": "canceled"}
     return kalshi.cancel_order(order_id)
 
 
-def _get_fill_count(order_id: str | None) -> int:
-    """Check how many contracts actually filled on a real (prod) order.
+def _actual_fill(response: dict) -> tuple[float, int] | None:
+    """Return `(per_contract_price, filled_qty)` from a Kalshi order
+    response, or `None` if the order did not fill.
 
-    Returns 0 if the order can't be found (IOC orders that don't fill are
-    canceled immediately and return 404 on lookup — that's a legitimate
-    'zero fills' result, not an error).
-    """
+    Kalshi's `/portfolio/orders` POST returns totals for the order:
+      - `fill_count_fp`            → total contracts filled (string, "2.00")
+      - `taker_fill_cost_dollars`  → total dollars paid as taker (string, "0.62")
+    Dividing recovers the per-contract VWAP. Using the limit price
+    instead would over-report losses on a winning IOC exit by ~40-60¢
+    per contract.
+
+    Logs every field we read so a schema-drift bug (e.g. Kalshi moving
+    to per-contract cost) is visible in prod without new instrumentation.
+
+    Dry-run / simulated responses don't carry cost info and return None."""
+    if not isinstance(response, dict):
+        return None
+    qty_raw = response.get("fill_count_fp")
+    cost_raw_taker = response.get("taker_fill_cost_dollars")
+    cost_raw_maker = response.get("maker_fill_cost_dollars")
+    order_id = response.get("order_id")
+
+    if qty_raw is None:
+        return None
+    try:
+        qty = int(float(qty_raw))
+    except (TypeError, ValueError):
+        return None
+    if qty <= 0:
+        return None
+
+    cost_raw = cost_raw_taker if cost_raw_taker is not None else cost_raw_maker
+    if cost_raw is None:
+        return None
+    try:
+        cost = float(cost_raw)
+    except (TypeError, ValueError):
+        return None
+
+    per_contract = round(cost / qty, 4)
+    logger.info(
+        f"[kalshi] _actual_fill order_id={order_id} "
+        f"fill_count_fp={qty_raw!r} "
+        f"taker_fill_cost_dollars={cost_raw_taker!r} "
+        f"maker_fill_cost_dollars={cost_raw_maker!r} "
+        f"→ qty={qty} total_cost=${cost:.4f} per_contract=${per_contract:.4f}"
+    )
+    # Sanity check: Kalshi contract prices are $0.01-$0.99. A
+    # per-contract number outside that range almost certainly means
+    # `*_fill_cost_dollars` is per-contract and we should NOT divide.
+    # Flag loudly and fall back to using the raw cost as the price.
+    if per_contract > 1.0 or per_contract <= 0:
+        logger.error(
+            f"[kalshi] per-contract price ${per_contract:.4f} is out of range "
+            f"[0.01, 0.99] — assuming taker_fill_cost_dollars is already "
+            f"per-contract. Using ${cost:.4f} as fill price."
+        )
+        return (round(cost, 4), qty)
+    return (per_contract, qty)
+
+
+def _fmt_pnl(pnl: float) -> str:
+    """Format P&L as +$0.15 / -$0.72 / $0.00 for log lines."""
+    if pnl > 0:
+        return f"+${pnl:.2f}"
+    if pnl < 0:
+        return f"-${abs(pnl):.2f}"
+    return "$0.00"
+
+
+def _parse_fp(val) -> int:
+    """Parse a Kalshi fixed-point count string (e.g. '3.00') into int.
+    Returns 0 on None / unparseable input — matches historical behavior."""
+    if val is None:
+        return 0
+    try:
+        return int(float(val))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _lookup_position_qty(market_ticker: str) -> int:
+    """Ask Kalshi whether we hold a position on this ticker right now.
+
+    Used as a fallback when the POST /portfolio/orders response claims
+    0 fills — a real position on the ticker means the order actually
+    filled and the app was about to orphan it.
+
+    Returns 0 on any lookup failure (we don't want this path to mask
+    legitimate zero-fill IOCs)."""
+    try:
+        positions = kalshi.get_live_positions(use_demo=False)
+    except Exception as e:
+        logger.error(f"_lookup_position_qty({market_ticker}) failed: {e}")
+        return 0
+    for pos in positions:
+        if pos.get("market_ticker") == market_ticker:
+            try:
+                return int(pos.get("quantity", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _get_fill_count(order_id: str | None) -> int:
+    """Follow-up GET for an order's fill count. DIAGNOSTIC ONLY now —
+    Trade.execute reads fill_count_fp from the POST response. This call
+    almost always 404s for filled IOC orders (they leave the open-orders
+    index once filled); kept so we can confirm that behavior in logs."""
     if not order_id or not kalshi.client:
         return 0
     try:
         order = kalshi.get_order(order_id, use_demo=False)
         if order is None:
             return 0
-        count_str = getattr(order, "fill_count_fp", None) or "0"
-        return int(float(count_str))
+        return _parse_fp(getattr(order, "fill_count_fp", None))
     except Exception as e:
         msg = str(e).lower()
         if "not_found" in msg or "404" in msg:
             return 0
-        logger.error(f"Failed to check fill count for {order_id}: {e}")
+        logger.error(f"_get_fill_count({order_id}): {e}")
         return 0
 
 
@@ -112,6 +237,13 @@ def _get_fill_count(order_id: str | None) -> int:
 _sessions: dict[tuple[str, int], "Session"] = {}
 _trade_index: dict[str, "Trade"] = {}
 _registry_lock = threading.Lock()
+
+# Tickers with an in-flight (non-terminal) trade. Guards against
+# double-firing on the same market — a second tap while a position is
+# already open would otherwise create an overlapping trade, doubling
+# exposure and complicating exit (two resting sells, two timers, etc).
+_active_tickers: set[str] = set()
+_active_tickers_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -137,11 +269,15 @@ class Session:
         user_id: str,
         game_id: int,
         settings: dict | None = None,
+        home_team: str | None = None,
+        away_team: str | None = None,
     ):
         from app.market_selector import DEFAULT_SETTINGS
         self.id = session_id
         self.user_id = user_id
         self.game_id = game_id
+        self.home_team = home_team
+        self.away_team = away_team
         self.groups: dict[str, "TradeGroup"] = {}
         self.settings: dict = dict(DEFAULT_SETTINGS)
         if settings:
@@ -152,6 +288,8 @@ class Session:
         self.realized_pnl = 0.0
         self.wins = 0
         self.resolved = 0
+        # Wall-clock for the [SESSION ...] CLOSED summary's duration field.
+        self.created_at: datetime = datetime.utcnow()
         self._lock = threading.Lock()
 
     def add_group(self, group: "TradeGroup") -> None:
@@ -278,6 +416,15 @@ class Trade:
         self._lock = threading.Lock()
         self._undo_timer: threading.Timer | None = None
         self._clean_timer: threading.Timer | None = None
+        # Throttle for tick-driven fill probes; REST position calls are
+        # rate-limited so we don't hammer /portfolio/positions on every
+        # tick once bid >= sell_target.
+        self._last_fill_probe_ts: float = 0.0
+        # Set to True if this trade is the one that claimed the ticker
+        # in the _active_tickers dedupe guard. Only the claimant releases
+        # on terminal transition — a skipped-duplicate trade must not
+        # discard the claim the original trade still holds.
+        self._owns_ticker_claim: bool = False
 
         # Module-level index so by-id lookups are O(1). Registered here
         # rather than in execute() so zero-fill trades (which return
@@ -328,6 +475,20 @@ class Trade:
             "trade_db_id": self.trade_db_id,
         }
 
+    # -- Log helpers --------------------------------------------------------
+
+    @property
+    def _log_prefix(self) -> str:
+        """Every lifecycle log line is scoped by `[TRADE {event} {id8}]`
+        so you can grep a single trade end-to-end without seeing the
+        rest of the session's traffic."""
+        return f"[TRADE {self.event} {self.id[:8]}]"
+
+    @property
+    def _short(self) -> str:
+        """Compact form of the market ticker for logs (e.g. ML-CLE)."""
+        return _short_ticker(self.market_ticker)
+
     # -- Lifecycle ----------------------------------------------------------
 
     def execute(self) -> "Trade":
@@ -338,6 +499,23 @@ class Trade:
         NOT raise — it sets status="canceled" and returns.
         """
         # Already registered in _trade_index by __init__.
+
+        # Dedupe: if this ticker is already in-flight, bail out before
+        # placing any order. Released in _notify_resolved on terminal
+        # transitions. This is the simplest "no orphan" guarantee —
+        # the second trade never touches Kalshi.
+        with _active_tickers_lock:
+            if self.market_ticker in _active_tickers:
+                logger.info(
+                    f"{self._log_prefix} SKIP {self._short} — ticker already in-flight"
+                )
+                with self._lock:
+                    self.status = "canceled"
+                self._log_to_db()
+                self._notify_resolved()
+                return self
+            _active_tickers.add(self.market_ticker)
+            self._owns_ticker_claim = True
 
         sizing = kalshi.calculate_position_size(
             self.market_ticker, self.side,
@@ -356,6 +534,25 @@ class Trade:
         stop_cents = self._settings.get("stop_loss_cents", STOP_LOSS_CENTS)
         self.stop_loss = max(0.01, round(self.entry_price - stop_cents / 100, 2))
 
+        # Execution-time safety check. _evaluate_market already gates on
+        # `sell_target > entry + 0.01`, but evaluation uses best-ask for
+        # entry while execution uses VWAP across the filled levels. If
+        # prices moved up between eval and fill (or we took a deep book)
+        # VWAP can exceed the original sell_target — placing the buy
+        # would lock in a guaranteed loss the moment the limit sell rests.
+        # Abort before touching Kalshi.
+        if self.sell_target <= self.entry_price + 0.01:
+            logger.error(
+                f"{self._log_prefix} ABORT sell_target=${self.sell_target:.2f} "
+                f"<= entry=${self.entry_price:.2f} + 1¢ — "
+                f"would lock in a loss; canceling before buy"
+            )
+            with self._lock:
+                self.status = "canceled"
+            self._log_to_db()
+            self._notify_resolved()
+            return self
+
         dry_run = bool(self._settings.get("dry_run", True))
 
         # --- IOC buy ---
@@ -371,13 +568,32 @@ class Trade:
         )
         self.buy_order_id = buy_result.get("order_id")
 
-        filled_qty = quantity if dry_run else _get_fill_count(self.buy_order_id)
+        if dry_run:
+            filled_qty = quantity
+        else:
+            # Fill count comes from the POST response body. Follow-up GET
+            # is unreliable for IOC (filled orders 404 out of the index).
+            filled_qty = _parse_fp(buy_result.get("fill_count_fp"))
+            # Last-ditch fallback: if POST says 0, sanity-check positions.
+            # Only logs when it actually saves us from an orphan.
+            if filled_qty == 0:
+                pos_qty = _lookup_position_qty(self.market_ticker)
+                if pos_qty > 0:
+                    logger.warning(
+                        f"{self._log_prefix} ORPHAN-SAVE {self._short} "
+                        f"POST fill=0 but Kalshi position qty={pos_qty}"
+                    )
+                    filled_qty = pos_qty
+
         if filled_qty == 0:
-            logger.info(f"Buy IOC got 0 fills for {self.event} {self.market_ticker} — no position")
+            logger.info(f"{self._log_prefix} BUY {self._short} → 0-fill (canceled)")
             with self._lock:
                 self.status = "canceled"
             self._log_to_db()
             self._notify_resolved()
+            # Safety net: IOC "no fill" is the most suspect path for lost
+            # trades. Confirm Kalshi agrees there's no position.
+            self._verify_position_closed(reason="zero-fill IOC")
             return self
 
         self.quantity = filled_qty
@@ -393,23 +609,18 @@ class Trade:
         except Exception as e:
             logger.error(f"snapshot_markets_for_game failed: {e}")
 
-        potential_profit = round((self.sell_target - self.entry_price) * filled_qty, 2)
-        summary = (
-            f"Trade plan [{self.event} {self.side} {self.market_ticker}] "
-            f"BUY {filled_qty}@${self.entry_price:.2f} "
-            f"(${sizing['total_cost']:.2f}) → "
-            f"SELL @${self.sell_target:.2f} "
-            f"(+${potential_profit:.2f} if filled) · stop=${self.stop_loss:.2f}"
+        logger.info(
+            f"{self._log_prefix} BUY {filled_qty} {self.side} {self._short} "
+            f"@${self.entry_price:.2f} → filled "
+            f"(target=${self.sell_target:.2f}, stop=${self.stop_loss:.2f})"
         )
 
         if self.use_undo_window:
             self._undo_timer = threading.Timer(UNDO_WINDOW_SECONDS, self._activate)
             self._undo_timer.daemon = True
             self._undo_timer.start()
-            logger.info(f"{summary} · sell in {UNDO_WINDOW_SECONDS}s (undo window)")
         else:
             self._activate()
-            logger.info(f"{summary} · timeout={CLEAN_WINDOW_SECONDS}s")
 
         return self
 
@@ -420,7 +631,6 @@ class Trade:
                 return   # user canceled during the window
             self.status = "open"
 
-        logger.info(f"Placing sell for {self.event} {self.market_ticker}")
         dry_run = bool(self._settings.get("dry_run", True))
         try:
             sell_result = _place_order(
@@ -433,12 +643,21 @@ class Trade:
                 dry_run=dry_run,
             )
             self.sell_order_id = sell_result.get("order_id")
+            logger.info(
+                f"{self._log_prefix} SELL {self.quantity} {self.side} {self._short} "
+                f"@${self.sell_target:.2f} → resting"
+            )
         except Exception as e:
-            logger.error(f"Sell placement failed for {self.event} {self.market_ticker}: {e}")
+            logger.error(
+                f"{self._log_prefix} SELL placement FAILED: {e} — "
+                f"buy filled qty={self.quantity} but sell did not rest; verifying position"
+            )
             with self._lock:
                 self.status = "error"
             self._update_db_status("error")
             self._notify_resolved()
+            # Orphan risk: buy filled, sell failed. Confirm against Kalshi.
+            self._verify_position_closed(reason="sell placement failed")
             return
 
         self._update_db_status("open")
@@ -448,43 +667,40 @@ class Trade:
         self._clean_timer.start()
 
     def _expire(self):
-        """Clean-window fired. Cancel resting sell and IOC exit."""
+        """Clean-window fired. If the limit sell already filled, finalize
+        as 'filled' at target. Otherwise cancel the sell and IOC-exit."""
         with self._lock:
             if self.status != "open":
                 return
+
+        # Before force-exiting, check whether the limit sell already
+        # executed. Cancel-404 or position=0 are both definitive. Selling
+        # contracts we don't hold creates a phantom fill / short position.
+        if self._sell_already_filled():
+            self._mark_filled_at_target()
+            return
+
+        with self._lock:
             self.status = "expired"
 
-        logger.info(f"Clean window expired for {self.event} {self.market_ticker} — force exiting")
+        logger.info(f"{self._log_prefix} TIMER {CLEAN_WINDOW_SECONDS}s expired — force exit")
         dry_run = bool(self._settings.get("dry_run", True))
 
-        if self.sell_order_id:
-            try:
-                _cancel_order(self.sell_order_id, dry_run=dry_run)
-            except Exception as e:
-                logger.error(f"Failed to cancel sell on expiry: {e}")
+        # Sell cancel already attempted by _sell_already_filled() (dry_run
+        # skips it entirely). No need to cancel again here.
 
-        try:
-            _place_order(
-                market_ticker=self.market_ticker,
-                action="sell",
-                side=self.side,
-                quantity=self.quantity,
-                price=0.01,
-                time_in_force="ioc",
-                dry_run=dry_run,
-            )
-        except Exception as e:
-            logger.error(f"Expiry exit sell failed: {e}")
-
-        prices = kalshi.get_prices(self.market_ticker)
-        exit_bid = prices["yes_bid"] if self.side == "YES" else prices["no_bid"]
+        exit_price = self._ioc_exit(reason="expired", dry_run=dry_run)
         with self._lock:
-            self.realized_pnl = round((exit_bid - self.entry_price) * self.quantity, 2)
-            self.exit_price = exit_bid
+            self.realized_pnl = round((exit_price - self.entry_price) * self.quantity, 2)
+            self.exit_price = exit_price
             self.completed_at = datetime.utcnow()
 
-        self._update_db_status("expired", exit_bid, self.realized_pnl)
+        logger.info(
+            f"{self._log_prefix} RESOLVED expired pnl={_fmt_pnl(self.realized_pnl)}"
+        )
+        self._update_db_status("expired", exit_price, self.realized_pnl)
         self._notify_resolved()
+        self._verify_position_closed(reason="expired")
 
     def cancel(self) -> dict | None:
         """User tapped undo during the undo window. IOC-exit held quantity.
@@ -499,40 +715,27 @@ class Trade:
                     f"Position {self.id} is '{self.status}' — can only cancel during undo window"
                 )
             self.status = "canceled_by_user"
+        logger.info(f"{self._log_prefix} UNDO user tapped cancel (qty={self.quantity})")
 
         if self._undo_timer:
             self._undo_timer.cancel()
 
-        exit_price = 0.0
         dry_run = bool(self._settings.get("dry_run", True))
+        exit_price = 0.0
         if self.quantity > 0:
-            try:
-                _place_order(
-                    market_ticker=self.market_ticker,
-                    action="sell",
-                    side=self.side,
-                    quantity=self.quantity,
-                    price=0.01,
-                    time_in_force="ioc",
-                    dry_run=dry_run,
-                )
-                prices = kalshi.get_prices(self.market_ticker)
-                exit_price = prices["yes_bid"] if self.side == "YES" else prices["no_bid"]
-            except Exception as e:
-                logger.error(f"Cancel exit sell failed for {self.market_ticker}: {e}")
+            exit_price = self._ioc_exit(reason="canceled_by_user", dry_run=dry_run)
 
         with self._lock:
             self.realized_pnl = round((exit_price - self.entry_price) * self.quantity, 2)
             self.exit_price = exit_price
             self.completed_at = datetime.utcnow()
 
+        logger.info(
+            f"{self._log_prefix} RESOLVED canceled_by_user pnl={_fmt_pnl(self.realized_pnl)}"
+        )
         self._update_db_status("canceled_by_user", exit_price, self.realized_pnl)
         self._notify_resolved()
-
-        logger.info(
-            f"Trade canceled (undo): {self.event} {self.market_ticker} "
-            f"qty={self.quantity} pnl={self.realized_pnl}"
-        )
+        self._verify_position_closed(reason="canceled_by_user")
 
         return {
             "position_id": self.id,
@@ -543,21 +746,43 @@ class Trade:
         }
 
     def on_price_tick(self, bid: float):
-        """Called on every Kalshi tick for this ticker. Runs stop-loss check.
+        """Called on every Kalshi tick for this ticker.
 
-        TODO: detect sell fills from bid ≥ sell_target. Today the trader
-        relies on Kalshi-side execution + the 45s clean-window timer; adding
-        tick-side fill detection is a behavior change, not a refactor.
+        Runs two checks:
+          - Fill probe: if bid has reached sell_target, confirm against
+            live positions (throttled). Catches the limit sell filling
+            before the 45s clean-window timer fires.
+          - Stop-loss: if bid dropped below stop, force exit.
         """
-        if not self._settings.get("use_stop_loss", True):
-            return
         with self._lock:
             if self.status != "open":
                 return
+
+        # Fill probe — only when bid actually reaches the target, and at
+        # most once every ~2s so a rapid flurry of ticks doesn't hammer
+        # /portfolio/positions.
+        if bid >= self.sell_target and not bool(self._settings.get("dry_run", True)):
+            import time as _time
+            now = _time.monotonic()
+            if now - self._last_fill_probe_ts >= 2.0:
+                self._last_fill_probe_ts = now
+                if _lookup_position_qty(self.market_ticker) == 0:
+                    # Guard against racing with _expire / stop-loss.
+                    with self._lock:
+                        if self.status != "open":
+                            return
+                    logger.info(
+                        f"{self._log_prefix} FILL tick-detected "
+                        f"bid=${bid:.2f} ≥ target=${self.sell_target:.2f}"
+                    )
+                    self._mark_filled_at_target()
+                    return
+
+        if not self._settings.get("use_stop_loss", True):
+            return
         if bid <= self.stop_loss:
             logger.warning(
-                f"Stop loss triggered for {self.event}: "
-                f"bid={bid:.2f} <= stop={self.stop_loss:.2f}"
+                f"{self._log_prefix} STOP-LOSS bid=${bid:.2f} ≤ stop=${self.stop_loss:.2f}"
             )
             self._execute_stop_loss(bid)
 
@@ -565,53 +790,215 @@ class Trade:
         with self._lock:
             if self.status != "open":
                 return
+
+        # Rare but possible: stop-loss fires after the limit sell already
+        # filled at target. If so, record the profitable fill rather than
+        # selling phantom contracts.
+        if self._sell_already_filled():
+            self._mark_filled_at_target()
+            return
+
+        with self._lock:
             self.status = "stopped"
 
         dry_run = bool(self._settings.get("dry_run", True))
 
         if self._clean_timer:
             self._clean_timer.cancel()
-        if self.sell_order_id:
-            try:
-                _cancel_order(self.sell_order_id, dry_run=dry_run)
-            except Exception as e:
-                logger.error(f"Failed to cancel limit sell {self.sell_order_id}: {e}")
-        if self.buy_order_id:
-            try:
-                _cancel_order(self.buy_order_id, dry_run=dry_run)
-            except Exception:
-                pass   # likely already filled
+        # Sell cancel already attempted inside _sell_already_filled().
+
+        # Trigger bid is just an estimate; use the real IOC fill price
+        # instead so P&L reflects what actually executed on Kalshi.
+        actual_exit = self._ioc_exit(reason="stopped", dry_run=dry_run, fallback_price=exit_price)
+
+        with self._lock:
+            self.realized_pnl = round((actual_exit - self.entry_price) * self.quantity, 2)
+            self.exit_price = actual_exit
+            self.completed_at = datetime.utcnow()
+
+        logger.info(
+            f"{self._log_prefix} RESOLVED stopped pnl={_fmt_pnl(self.realized_pnl)}"
+        )
+        self._update_db_status("stopped", actual_exit, self.realized_pnl)
+        self._notify_resolved()
+        self._verify_position_closed(reason="stopped")
+
+    # -- Fill detection ----------------------------------------------------
+
+    def _sell_already_filled(self) -> bool:
+        """Return True only when the resting limit sell has definitely
+        executed on Kalshi. Exit-path sanity check — before any `_expire`
+        or stop-loss force-exit, confirm whether the sell is still resting.
+
+        Signal hierarchy:
+          - Cancel returns 200 → sell was resting and we just canceled it.
+            Contracts are still held; caller must IOC-exit. Return False.
+            (A stale positions lookup here previously caused false-positive
+            'filled' reports — never cross-check on a successful cancel.)
+          - Cancel raises 404 / not_found → order left the open-orders
+            index. For a GTC limit sell the only way that happens is a
+            fill. Cross-check positions: qty==0 confirms fill → True;
+            qty>0 means we're in a weird partial / race state → False
+            (caller proceeds with IOC-exit on what remains).
+          - Any other exception → re-raise. Don't guess; let the caller
+            (clean-window timer) surface the problem rather than act on
+            ambiguous state.
+
+        Dry-run never actually fills, so we short-circuit False there."""
+        if bool(self._settings.get("dry_run", True)):
+            return False
+        if not self.sell_order_id:
+            return False
 
         try:
-            _place_order(
+            _cancel_order(self.sell_order_id, dry_run=False)
+            # 200 — the sell was still resting when we canceled it.
+            # We still hold the contracts; IOC exit is required.
+            logger.info(f"{self._log_prefix} CANCEL sell → 200 OK (was resting)")
+            return False
+        except Exception as e:
+            msg = str(e).lower()
+            if "not_found" not in msg and "404" not in msg:
+                raise
+            logger.info(f"{self._log_prefix} CANCEL sell → 404 (already gone)")
+            qty = _lookup_position_qty(self.market_ticker)
+            logger.info(f"{self._log_prefix} POSITION CHECK → {qty} contracts")
+            if qty == 0:
+                return True
+            logger.warning(
+                f"{self._log_prefix} partial/race — sell 404 but qty={qty}; caller will IOC-exit"
+            )
+            return False
+
+    def _ioc_exit(
+        self,
+        *,
+        reason: str,
+        dry_run: bool,
+        fallback_price: float | None = None,
+    ) -> float:
+        """Place the $0.01 IOC force-exit sell and return the per-contract
+        exit price that actually executed on Kalshi.
+
+        Kalshi fills IOC sells at whatever bid was available (not the
+        $0.01 limit), so the real exit price comes from the POST response:
+        `taker_fill_cost_dollars / fill_count_fp`. This is what P&L must
+        use — using the $0.01 limit would over-report losses by the
+        entire bid value.
+
+        If the IOC doesn't fill at all (no bids at ≥$0.01 — rare), we
+        fall back to `fallback_price` if provided, otherwise the current
+        bid on the trade's side. Dry-run always uses the current bid."""
+        limit_price = 0.01
+        try:
+            response = _place_order(
                 market_ticker=self.market_ticker,
                 action="sell",
                 side=self.side,
                 quantity=self.quantity,
-                price=0.01,
+                price=limit_price,
                 time_in_force="ioc",
                 dry_run=dry_run,
             )
         except Exception as e:
-            logger.error(f"Stop-loss sell failed for {self.market_ticker}: {e}")
+            logger.error(f"{self._log_prefix} EXIT IOC sell failed: {e}")
+            return self._fallback_exit_price(fallback_price)
 
+        if dry_run:
+            # Sim doesn't report real fills — approximate with current bid.
+            exit_price = self._fallback_exit_price(fallback_price)
+            logger.info(
+                f"{self._log_prefix} EXIT IOC sell {self.quantity} → "
+                f"filled @${exit_price:.2f} [sim] (limit was ${limit_price:.2f})"
+            )
+            return exit_price
+
+        fill = _actual_fill(response)
+        if fill is None:
+            # IOC returned no fills — no bids at ≥$0.01 (very rare). Use
+            # the fallback / current bid so P&L still reflects something.
+            exit_price = self._fallback_exit_price(fallback_price)
+            logger.warning(
+                f"{self._log_prefix} EXIT IOC sell {self.quantity} → 0 fills "
+                f"(limit was ${limit_price:.2f}); using fallback ${exit_price:.2f}"
+            )
+            return exit_price
+
+        per_contract, filled_qty = fill
+        tag = "filled" if filled_qty == self.quantity else f"partial {filled_qty}/{self.quantity}"
+        logger.info(
+            f"{self._log_prefix} EXIT IOC sell {self.quantity} → "
+            f"{tag} @${per_contract:.2f} (limit was ${limit_price:.2f})"
+        )
+        return per_contract
+
+    def _fallback_exit_price(self, fallback_price: float | None) -> float:
+        """Used when an IOC exit returns no fill data (sim, zero-fill,
+        or placement error). Prefer the caller-supplied fallback (e.g.
+        the bid that triggered a stop-loss), then the current bid on
+        this trade's side, then 0.0 as last resort."""
+        if fallback_price is not None:
+            return fallback_price
+        try:
+            prices = kalshi.get_prices(self.market_ticker)
+            return prices["yes_bid"] if self.side == "YES" else prices["no_bid"]
+        except Exception:
+            return 0.0
+
+    def _mark_filled_at_target(self) -> None:
+        """Finalize the trade as 'filled' at sell_target. Used when we
+        detect the limit sell already executed on Kalshi."""
+        if self._clean_timer:
+            self._clean_timer.cancel()
+        exit_price = self.sell_target
         with self._lock:
+            self.status = "filled"
             self.realized_pnl = round((exit_price - self.entry_price) * self.quantity, 2)
             self.exit_price = exit_price
             self.completed_at = datetime.utcnow()
-
-        self._update_db_status("stopped", exit_price, self.realized_pnl)
+        logger.info(
+            f"{self._log_prefix} RESOLVED filled pnl={_fmt_pnl(self.realized_pnl)} "
+            f"(qty={self.quantity} @${exit_price:.2f})"
+        )
+        self._update_db_status("filled", exit_price, self.realized_pnl)
         self._notify_resolved()
+
+    # -- Safety net --------------------------------------------------------
+
+    def _verify_position_closed(self, *, reason: str) -> None:
+        """After a terminal transition, confirm we don't have an orphaned
+        position on Kalshi. Dry-run is skipped (no real position possible).
+
+        Runs best-effort: exceptions are logged and swallowed so the
+        verification never masks a real terminal-state transition.
+        """
+        if bool(self._settings.get("dry_run", True)):
+            return
+        try:
+            positions = kalshi.get_live_positions(use_demo=False)
+        except Exception as e:
+            logger.error(
+                f"_verify_position_closed: failed to fetch positions "
+                f"(trade {self.id} {self.market_ticker}, reason={reason}): {e}"
+            )
+            return
+        for pos in positions:
+            if pos.get("market_ticker") != self.market_ticker:
+                continue
+            qty = int(pos.get("quantity", 0) or 0)
+            if qty == 0:
+                continue
+            logger.error(
+                f"{self._log_prefix} ORPHANED POSITION {self._short} qty={qty} "
+                f"status={self.status} reason={reason} "
+                f"buy_order_id={self.buy_order_id} sell_order_id={self.sell_order_id}"
+            )
 
     # -- Supabase ----------------------------------------------------------
 
     def _log_to_db(self):
         """Insert the initial trades row. Populates self.trade_db_id.
         Single INSERT now that `log_trade` takes `undo_group_id` directly."""
-        logger.info(
-            f"Trade._log_to_db: {self.event} {self.market_ticker} "
-            f"session_id={self.session_id} user_id={self.user_id}"
-        )
         try:
             tid = db.log_trade(
                 session_id=self.session_id,
@@ -634,7 +1021,21 @@ class Trade:
         are computed once the whole group is resolved.
 
         Looked up by (user_id, game_id) rather than held as a direct
-        reference so Trade stays ignorant of the Session object."""
+        reference so Trade stays ignorant of the Session object.
+
+        Also pushes a `positions_update` SSE event to the owning user so
+        the UI flips from active → terminal immediately instead of waiting
+        for the next 60s /positions poll. Every terminal-state path in
+        Trade (and TradeGroup.execute's skip branch) routes through here,
+        so one hook covers them all."""
+        # Release the dedupe claim — but only if THIS trade is the one
+        # that took it. A skipped-duplicate trade also reaches this path
+        # and must not free the slot the original trade still holds.
+        if self._owns_ticker_claim:
+            with _active_tickers_lock:
+                _active_tickers.discard(self.market_ticker)
+            self._owns_ticker_claim = False
+
         with _registry_lock:
             session = _sessions.get((self.user_id, self.game_id)) if self.user_id else None
         if session is not None:
@@ -643,13 +1044,19 @@ class Trade:
             except Exception as e:
                 logger.error(f"_notify_resolved: {e}")
 
+        # SSE push. Late import to avoid circular load.
+        try:
+            from app.market_selector import notify_sse_positions_changed
+            notify_sse_positions_changed(self.game_id, self.user_id)
+        except Exception as e:
+            logger.error(f"_notify_resolved SSE push failed: {e}")
+
     def _update_db_status(
         self,
         status: str,
         exit_price: float | None = None,
         pnl: float | None = None,
     ):
-        logger.info(f"Trade._update_db_status: {self.event} → {status} (trade_db_id={self.trade_db_id})")
         try:
             db.update_trade_status(self.trade_db_id, status, exit_price, pnl)
         except Exception as e:
@@ -725,7 +1132,7 @@ class TradeGroup:
             try:
                 t.execute()
             except RuntimeError as e:
-                logger.info(f"TradeGroup member skipped: {e}")
+                logger.info(f"{t._log_prefix} SKIP {t._short} — {e}")
                 with t._lock:
                     if t.status == "pending":
                         t.status = "canceled"
@@ -794,7 +1201,10 @@ def get_or_create_session(
     sid = db.get_or_create_session(user_id, game_id, home_team, away_team, seeded)
     if not sid:
         return None
-    session = Session(sid, user_id, game_id, settings=seeded)
+    session = Session(
+        sid, user_id, game_id, settings=seeded,
+        home_team=home_team, away_team=away_team,
+    )
     with _registry_lock:
         # Double-checked: another thread may have just populated the cache.
         cached = _sessions.get(key)
@@ -931,6 +1341,10 @@ def _find_trade(trade_id: str) -> Trade | None:
         return _trade_index.get(trade_id)
 
 
+# Public alias for callers outside this module (e.g. the debug endpoint).
+find_trade = _find_trade
+
+
 def execute_trade(
     game_id: int,
     event: str,
@@ -1003,14 +1417,17 @@ def cancel_position(position_id: str) -> dict:
 
 def check_stop_losses(market_ticker: str, prices: dict):
     """Websocket tick callback. Iterates active trades via sessions so we
-    skip the huge tail of terminal trades that can't stop-out anyway.
-    Each session's use_stop_loss setting is checked independently — one
-    user's toggle doesn't disable stop-loss for anyone else."""
+    skip the huge tail of terminal trades that can't react to ticks.
+
+    Always fires `on_price_tick`, which internally runs:
+      - fill probe (always) — detects a limit sell hitting target
+      - stop-loss check (gated on the session's use_stop_loss)
+
+    Previously this was gated up front by use_stop_loss, which also
+    disabled fill detection. Keep the gate inside on_price_tick."""
     with _registry_lock:
         sessions = list(_sessions.values())
     for s in sessions:
-        if not s.settings.get("use_stop_loss", True):
-            continue
         for t in s.active_trades():
             if t.market_ticker != market_ticker or t.status != "open":
                 continue
@@ -1032,5 +1449,20 @@ def close_and_flush_sessions_for_game(game_id: int) -> None:
             db.close_session(session.id, session.total_trades, session.realized_pnl)
         except Exception as e:
             logger.error(f"close session {session.id} failed: {e}")
+
+        # Session summary line — one per user per game, at close.
+        dur_min = max(0, int((datetime.utcnow() - session.created_at).total_seconds() // 60))
+        teams = (
+            f"{session.away_team}@{session.home_team}"
+            if session.home_team and session.away_team
+            else "?@?"
+        )
+        logger.info(
+            f"[SESSION {session.id[:8]}] CLOSED game={game_id} {teams} "
+            f"trades={session.total_trades} wins={session.wins} "
+            f"resolved={session.resolved} "
+            f"pnl={_fmt_pnl(session.realized_pnl)} duration={dur_min}m"
+        )
+
         with _registry_lock:
             _sessions.pop(key, None)

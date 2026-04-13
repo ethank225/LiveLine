@@ -116,6 +116,28 @@ class KalshiManager:
             rate_limiter=RateLimiter(requests_per_second=8.0),
         )
 
+        # On the REAL-money client, wrap .post so every /portfolio/orders
+        # call logs the raw response dict before pydantic parses it (and
+        # before `extra="ignore"` drops any unknown fields). This is how
+        # we caught the lost-trade bug: the POST body has fill_count_fp;
+        # the follow-up GET 404s. The raw log is the source of truth.
+        if not demo:
+            _orig_post = self.client.post
+
+            def _logging_post(endpoint: str, data):
+                resp = _orig_post(endpoint, data)
+                if endpoint.startswith("/portfolio/orders") and isinstance(resp, dict):
+                    # At INFO while we validate fill-cost semantics
+                    # (per-contract vs. total). Can drop back to DEBUG
+                    # once _actual_fill is confirmed correct.
+                    try:
+                        logger.info(f"[kalshi] POST {endpoint} body: {resp}")
+                    except Exception:
+                        pass
+                return resp
+
+            self.client.post = _logging_post  # type: ignore[method-assign]
+
         self.feed = self.client.feed()
         self.feed.on("ticker", self._on_ticker)
         self.feed.on("orderbook_delta", self._on_orderbook)
@@ -463,6 +485,8 @@ class KalshiManager:
                 kwargs["no_price_dollars"] = f"{price:.2f}"
 
         order = client.portfolio.place_order(**kwargs)
+        # Raw POST body is already logged by the client-level hook in
+        # connect(); no need to re-dump the parsed object here.
         return {
             "order_id": getattr(order, "order_id", None),
             "status": str(getattr(order, "status", "unknown")).split(".")[-1].lower(),
@@ -471,6 +495,19 @@ class KalshiManager:
             "side": side,
             "quantity": quantity,
             "price": price,
+            # Pass through any fill info the place_order response may contain.
+            # Some APIs return fill data on the initial order response for IOC
+            # orders (avoiding the need for a follow-up get_order call).
+            "fill_count_fp": getattr(order, "fill_count_fp", None),
+            "filled_count": getattr(order, "filled_count", None),
+            "quantity_filled": getattr(order, "quantity_filled", None),
+            "remaining_count_fp": getattr(order, "remaining_count_fp", None),
+            # Taker / maker fill cost in dollars. Dividing by fill_count
+            # gives the actual VWAP per contract — the only correct way
+            # to compute P&L on an IOC exit (the limit price is $0.01,
+            # but the real fill lands at whatever the bid was).
+            "taker_fill_cost_dollars": getattr(order, "taker_fill_cost_dollars", None),
+            "maker_fill_cost_dollars": getattr(order, "maker_fill_cost_dollars", None),
         }
 
     def batch_place_orders(self, orders: list[dict]) -> list[dict]:

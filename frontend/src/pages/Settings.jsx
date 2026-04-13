@@ -1,10 +1,13 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { api } from '../api'
 import { useAuth } from '../AuthContext'
 import { SettingsSkeletonContent } from '../components/Skeleton'
 import { SettingsHeader } from '../components/Header'
 
-const ALPHA_STEPS = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+// Keys that auto-save via debounced PUT /settings the moment they change.
+// Everything else still goes through the Save button at the bottom.
+const AUTO_SAVE_KEYS = ['max_dollars', 'alpha']
+const AUTO_SAVE_DEBOUNCE_MS = 500
 
 export default function Settings() {
   const { user, signOut } = useAuth()
@@ -12,9 +15,45 @@ export default function Settings() {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
 
+  // Tracks the last-saved value for each auto-save key so a change to
+  // another control (which would fire the useEffect) doesn't re-PUT an
+  // unchanged max_dollars / alpha.
+  const lastSaved = useRef({})
+  const saveTimer = useRef(null)
+
   useEffect(() => {
-    api.getSettings().then(setSettings).catch(() => {})
+    api.getSettings().then(s => {
+      setSettings(s)
+      // Seed lastSaved so the initial load isn't treated as a change.
+      if (s) {
+        AUTO_SAVE_KEYS.forEach(k => { lastSaved.current[k] = s[k] })
+      }
+    }).catch(() => {})
   }, [])
+
+  // Debounced auto-save for max_dollars / alpha. Fires only when one of
+  // them actually changes vs. the last saved value (prevents a spurious
+  // PUT every time a toggle toggles).
+  useEffect(() => {
+    if (!settings) return
+    const changed = AUTO_SAVE_KEYS.some(k => settings[k] !== lastSaved.current[k])
+    if (!changed) return
+    if (saveTimer.current) clearTimeout(saveTimer.current)
+    saveTimer.current = setTimeout(async () => {
+      const payload = {}
+      AUTO_SAVE_KEYS.forEach(k => { payload[k] = settings[k] })
+      try {
+        const result = await api.updateSettings(payload)
+        // Mirror the backend's clamped values back into local state so
+        // an out-of-range entry (e.g. 99999) visibly snaps to the max.
+        setSettings(prev => ({ ...prev, ...result }))
+        AUTO_SAVE_KEYS.forEach(k => { lastSaved.current[k] = result[k] })
+      } catch { /* best effort — keep the user's typed value */ }
+    }, AUTO_SAVE_DEBOUNCE_MS)
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current)
+    }
+  }, [settings])
 
   const update = (key, value) => {
     setSettings(prev => ({ ...prev, [key]: value }))
@@ -41,37 +80,22 @@ export default function Settings() {
       ) : (
       <div className="px-4 pb-8 space-y-5">
 
-        {/* Bet size */}
-        <Field label="Max dollars per trade">
-          <NumberInput
-            value={settings.max_dollars}
-            onChange={v => update('max_dollars', v)}
-            min={1} max={10000} step={50}
-            prefix="$"
-          />
-        </Field>
+        {/* Max bet size — typeable, auto-saves 500ms after last keystroke */}
+        <InlineNumber
+          label="Max bet size ($)"
+          value={settings.max_dollars}
+          onChange={v => update('max_dollars', v)}
+          min={1} max={5000} step={1}
+        />
 
-        {/* Alpha */}
-        <Field
-          label="Target capture (alpha)"
+        {/* Alpha — typeable, auto-saves 500ms after last keystroke */}
+        <InlineNumber
+          label="Alpha (sell aggressiveness)"
           desc="Higher = more profit per trade but lower fill rate"
-        >
-          <div className="flex gap-2">
-            {ALPHA_STEPS.map(a => (
-              <button
-                key={a}
-                onClick={() => update('alpha', a)}
-                className={`flex-1 py-1.5 rounded-lg text-xs font-mono font-semibold transition-colors ${
-                  settings.alpha === a
-                    ? 'bg-blue-500 text-white'
-                    : 'bg-slate-800 text-slate-400 active:bg-slate-700'
-                }`}
-              >
-                {a}
-              </button>
-            ))}
-          </div>
-        </Field>
+          value={settings.alpha}
+          onChange={v => update('alpha', v)}
+          min={0.1} max={1.0} step={0.1}
+        />
 
         {/* Max slippage */}
         <Field
@@ -217,6 +241,57 @@ function Toggle({ label, desc, value, onChange, warning, warningText }) {
           }`}
         />
       </button>
+    </div>
+  )
+}
+
+// Typeable number input laid out like a Toggle row (label left, control
+// right). Used for settings that auto-save on change — the native
+// <input type="number"> gives keyboard + mobile stepper support, and
+// we coerce to a number before bubbling up so downstream comparisons
+// (lastSaved) aren't fooled by string vs. number.
+function InlineNumber({ label, desc, value, onChange, min, max, step }) {
+  const handleChange = (e) => {
+    const raw = e.target.value
+    if (raw === '') {
+      onChange('')   // let the user clear the field while typing
+      return
+    }
+    const n = Number(raw)
+    if (Number.isNaN(n)) return
+    onChange(n)
+  }
+  const handleBlur = () => {
+    // On blur, snap an empty / out-of-range value back to something
+    // sensible so we never PUT garbage to the backend.
+    if (value === '' || value == null || Number.isNaN(Number(value))) {
+      onChange(min)
+      return
+    }
+    const n = Number(value)
+    if (n < min) onChange(min)
+    else if (n > max) onChange(max)
+  }
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-medium text-white">{label}</div>
+        {desc && <div className="text-xs text-slate-500 mt-0.5">{desc}</div>}
+      </div>
+      <input
+        type="number"
+        inputMode="decimal"
+        value={value ?? ''}
+        onChange={handleChange}
+        onBlur={handleBlur}
+        min={min}
+        max={max}
+        step={step}
+        className="w-24 bg-slate-800 rounded-lg px-3 py-2 text-center
+                   text-sm font-mono font-semibold text-white
+                   border border-slate-700 focus:border-blue-500
+                   focus:outline-none"
+      />
     </div>
   )
 }

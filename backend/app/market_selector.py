@@ -128,6 +128,13 @@ _discovered_games: set[int] = set()
 _game_deltas: dict[int, list[EventDelta]] = {}
 _delta_lock = threading.Lock()
 
+# Last logged compute_best_trades signature per game, so per-subscriber
+# SSE recomputes don't re-print the same delta table every ~2s. The
+# signature covers the deltas + market lines + scores; any real change
+# yields a new signature and a new log line.
+_last_compute_sig: dict[int, str] = {}
+_last_compute_sig_lock = threading.Lock()
+
 # game_id -> (home_score, away_score) for dynamic line selection on recompute
 _game_scores: dict[int, tuple[int, int]] = {}
 _score_lock = threading.Lock()
@@ -397,11 +404,13 @@ def _evaluate_market(
     # upside — skip it entirely so it never lands in all_trades for
     # multi-market mode to pick.
     #
-    #   entry >= 0.95 — ceiling at $1; basically zero upside after fees
-    #   entry <= 0.05 — floor at $0; same deal from the other side
-    #   sell_target <= entry — target below cost = negative-profit trade
+    #   entry >= 0.95           — ceiling at $1; basically zero upside after fees
+    #   entry <= 0.05           — floor at $0; same deal from the other side
+    #   target <= entry + 0.01  — need at least 1¢ profit to clear fees and
+    #                             ensure the trade isn't a guaranteed loss
+    #                             after price moves between eval and fill.
     def _is_dead(entry: float, target: float) -> bool:
-        return entry >= 0.95 or entry <= 0.05 or target <= entry
+        return entry >= 0.95 or entry <= 0.05 or target <= entry + 0.01
 
     # YES side: profitable when delta > 0
     if d > 0 and yes_ask > 0 and yes_bid > 0:
@@ -513,26 +522,41 @@ def compute_best_trades(
     if sp_market:
         logger.debug(f"Game {game_id}: Spread picked {sp_market.label} (margin={margin})")
 
-    # --- DIAGNOSTIC ------------------------------------------------------
-    # Prints per-event deltas so we can see whether the problem is upstream
-    # (compute_deltas returning same values) or in trade construction
-    # (same delta → same trade). Toggle via `logger.setLevel(logging.INFO)`.
+    # Per-event delta table — useful for debugging, but fires once per
+    # subscriber per recompute (every ~2s). Dedupe on a signature of
+    # (deltas, lines, scores) so we only print when something changed.
     ou_key = str(ou_market.line) if ou_market else None
     sp_key = str(sp_market.line) if sp_market else None
-    logger.info(
-        f"compute_best_trades game={game_id} "
-        f"ou_line={ou_key} sp_line={sp_key} "
-        f"ml_markets={len(ml_markets)} total_runs={total_runs} margin={margin}"
-    )
+    sig_parts: list[str] = [
+        f"ou={ou_key}", f"sp={sp_key}",
+        f"hs={home_score}", f"as={away_score}",
+    ]
     for d in deltas:
-        ou_delta = d.over_under.get(ou_key, {}).get("delta") if ou_key else None
-        sp_delta = d.spread.get(sp_key, {}).get("delta") if sp_key else None
+        ou_d = d.over_under.get(ou_key, {}).get("delta") if ou_key else None
+        sp_d = d.spread.get(sp_key, {}).get("delta") if sp_key else None
+        sig_parts.append(f"{d.event}:{d.delta:+.4f}:{ou_d}:{sp_d}")
+    sig = "|".join(sig_parts)
+
+    with _last_compute_sig_lock:
+        prev_sig = _last_compute_sig.get(game_id)
+        changed = sig != prev_sig
+        if changed:
+            _last_compute_sig[game_id] = sig
+
+    if changed:
         logger.info(
-            f"  event={d.event:<3} ml_delta={d.delta:+.4f} "
-            f"ou_delta={ou_delta if ou_delta is None else f'{ou_delta:+.4f}'} "
-            f"sp_delta={sp_delta if sp_delta is None else f'{sp_delta:+.4f}'}"
+            f"compute_best_trades game={game_id} "
+            f"ou_line={ou_key} sp_line={sp_key} "
+            f"ml_markets={len(ml_markets)} total_runs={total_runs} margin={margin}"
         )
-    # --------------------------------------------------------------------
+        for d in deltas:
+            ou_delta = d.over_under.get(ou_key, {}).get("delta") if ou_key else None
+            sp_delta = d.spread.get(sp_key, {}).get("delta") if sp_key else None
+            logger.info(
+                f"  event={d.event:<3} ml_delta={d.delta:+.4f} "
+                f"ou_delta={ou_delta if ou_delta is None else f'{ou_delta:+.4f}'} "
+                f"sp_delta={sp_delta if sp_delta is None else f'{sp_delta:+.4f}'}"
+            )
 
     result: dict[str, dict] = {}
     _seen_trade_ids: dict[int, str] = {}   # probes accidental dict sharing
@@ -793,6 +817,27 @@ def sse_subscriber_count(game_id: int) -> int:
 def notify_sse_game_state(game_id: int, game_state: dict):
     """Push a game_state update to all SSE subscribers (user-agnostic)."""
     _push_sse(game_id, {"type": "game_state", "game_state": game_state})
+
+
+def notify_sse_positions_changed(game_id: int, user_id: str | None = None) -> None:
+    """Tell connected clients that positions for this (game, user) changed.
+
+    Used on terminal-state transitions (filled / expired / stopped /
+    canceled) so the UI updates instantly instead of waiting for the
+    next 60s /positions poll. Scoped to `user_id` when provided so
+    we don't wake up every viewer of the game for one user's fill.
+    Omitting user_id broadcasts to everyone on the game (used when the
+    target user isn't known, e.g. batch closes).
+    """
+    if _loop is None:
+        return
+    payload = {"type": "positions_update", "game_id": game_id}
+    with _sse_lock:
+        subs = list(_sse_queues.get(game_id, []))
+    for queue, uid in subs:
+        if user_id is not None and uid != user_id:
+            continue
+        _loop.call_soon_threadsafe(queue.put_nowait, payload)
 
 
 def _notify_sse(game_id: int):

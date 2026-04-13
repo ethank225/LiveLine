@@ -46,6 +46,7 @@ from app.trader import (
     cancel_position,
     check_stop_losses,
     execute_trade,
+    find_trade,
     get_pnl,
     get_positions,
 )
@@ -54,6 +55,35 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s:%(name)s: %(message)s",
 )
+# HTTP client + Kalshi SDK: suppress per-request INFO lines (JWTs,
+# URLs) — they only matter when they're failing.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("pykalshi").setLevel(logging.WARNING)
+# Market selector: hide the per-compute delta table + discovery logs.
+# Warnings/errors (no Kalshi event, flush failures) still come through.
+logging.getLogger("app.market_selector").setLevel(logging.WARNING)
+
+
+class _QuietAccessLogFilter(logging.Filter):
+    """Uvicorn access log is noisy: /positions and /refresh fire on
+    timers and swamp the trade logs. Drop them at INFO but keep /buy,
+    /cancel, /debug, and anything non-2xx so real signals come through."""
+
+    _QUIET_PATHS = ("/positions", "/refresh", "/balance", "/history", "/stream")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        # Uvicorn access log format: '<ip> - "METHOD /path HTTP/1.1" <status>'.
+        # Keep anything that doesn't look like a 2xx to a quiet path.
+        if any(p in msg for p in self._QUIET_PATHS):
+            # Let warnings/errors through; drop 2xx/3xx only.
+            if ' 2' in msg or ' 3' in msg:
+                return False
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_QuietAccessLogFilter())
 logger = logging.getLogger(__name__)
 
 
@@ -702,6 +732,37 @@ async def cancel_trade(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cancel failed: {e}")
     return result
+
+
+@app.post("/debug/simulate-fill/{trade_id}")
+async def debug_simulate_fill(
+    trade_id: str,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Dry-run only. Manually mark a trade as filled at sell_target so the
+    UI flip to the terminal state can be exercised without a real fill.
+
+    Guarded: the trade must exist, belong to the caller, be in a live
+    status (undo_window or open), and have dry_run=true on its snapshotted
+    settings. Anything else returns 404 so this surface leaks no info."""
+    trade = find_trade(trade_id)
+    if (
+        trade is None
+        or trade.user_id != user.id
+        or not trade._settings.get("dry_run")
+        or trade.status not in ("undo_window", "open")
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # Run off the event loop — _mark_filled_at_target writes to Supabase
+    # and pushes SSE, neither of which should block the async thread.
+    await asyncio.to_thread(trade._mark_filled_at_target)
+    return {
+        "position_id": trade.id,
+        "status": trade.status,
+        "exit_price": trade.exit_price,
+        "realized_pnl": trade.realized_pnl,
+    }
 
 
 @app.get("/positions")
