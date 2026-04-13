@@ -273,9 +273,17 @@ _SINGLE_TABLE = {
     "110": ("101", 1), "101": ("101", 1), "011": ("100", 2), "111": ("101", 2),
 }
 
-_DOUBLE_TABLE = {
-    "000": ("010", 0), "100": ("010", 1), "010": ("010", 1), "001": ("010", 1),
-    "110": ("010", 2), "101": ("010", 2), "011": ("010", 2), "111": ("010", 3),
+# 2B is probabilistic: R1 only scores ~45% of the time on a double.
+# Each entry is a list of (probability, new_bases, runs_scored) outcomes.
+_DOUBLE_TABLE: dict[str, list[tuple[float, str, int]]] = {
+    "000": [(1.0, "010", 0)],
+    "100": [(0.45, "010", 1), (0.55, "011", 0)],
+    "010": [(1.0, "010", 1)],
+    "001": [(1.0, "010", 1)],
+    "110": [(0.45, "010", 2), (0.55, "011", 1)],
+    "101": [(0.45, "010", 2), (0.55, "011", 1)],
+    "011": [(1.0, "010", 2)],
+    "111": [(0.45, "010", 3), (0.55, "011", 2)],
 }
 
 _HR_TABLE = {
@@ -283,9 +291,15 @@ _HR_TABLE = {
     "110": ("000", 3), "101": ("000", 3), "011": ("000", 3), "111": ("000", 4),
 }
 
+# Standard force DP advances trailing runners one base.
 _DP_TABLE = {
-    "100": ("000", 0), "010": ("000", 0), "001": ("000", 0),
-    "110": ("001", 0), "101": ("000", 1), "011": ("010", 0), "111": ("001", 1),
+    "100": ("000", 0),
+    "010": ("000", 0),
+    "001": ("000", 0),
+    "110": ("010", 0),  # R2 advances to 3B
+    "101": ("010", 1),  # R3 scores
+    "011": ("001", 0),  # R3 holds, R2 out
+    "111": ("011", 1),  # R3 scores, R2 to 3B
 }
 
 
@@ -337,7 +351,9 @@ def apply_event(state: GameState, event: str) -> Optional[GameState]:
         return GameState(state.inning, state.half, state.outs, new_runners, new_sd)
 
     elif event == "2B":
-        new_runners, runs = _DOUBLE_TABLE[state.runners]
+        # Pick the most-likely outcome for the discrete state transition.
+        outcomes = _DOUBLE_TABLE[state.runners]
+        _, new_runners, runs = max(outcomes, key=lambda o: o[0])
         new_sd = _apply_score(state, runs)
         return GameState(state.inning, state.half, state.outs, new_runners, new_sd)
 
@@ -359,8 +375,11 @@ def apply_event(state: GameState, event: str) -> Optional[GameState]:
     return None
 
 
-def _runs_scored(state: GameState, event: str) -> int:
-    """How many runs does this event produce from the current state?"""
+def _runs_scored(state: GameState, event: str) -> float:
+    """Expected runs this event produces from the current state.
+
+    Integer for deterministic events; can be fractional for probabilistic ones (2B).
+    """
     if event == "K":
         return 0
     if event == "OUT":
@@ -374,7 +393,10 @@ def _runs_scored(state: GameState, event: str) -> int:
             return 0
         _, r = _DP_TABLE[state.runners]
         return r
-    table = {"BB": _BB_TABLE, "1B": _SINGLE_TABLE, "2B": _DOUBLE_TABLE, "HR": _HR_TABLE}
+    if event == "2B":
+        # Expected runs across probabilistic outcomes.
+        return sum(prob * runs for prob, _, runs in _DOUBLE_TABLE[state.runners])
+    table = {"BB": _BB_TABLE, "1B": _SINGLE_TABLE, "HR": _HR_TABLE}
     _, r = table[event][state.runners]
     return r
 
@@ -429,6 +451,68 @@ def compute_deltas(
         if new_state is None:
             continue
 
+        ou_dict: dict = {}
+        sp_dict: dict = {}
+
+        if event == "2B":
+            # Probabilistic outcomes: weighted-average WE/OU/SP across them.
+            outcomes = _DOUBLE_TABLE[state.runners]
+            new_we = 0.0
+            ou_after_acc: dict[str, float] = {str(line): 0.0 for line in use_ou}
+            sp_after_acc: dict[str, float] = {str(line): 0.0 for line in use_sp}
+
+            for prob, new_bases, runs in outcomes:
+                new_sd = _apply_score(state, runs)
+                ns = GameState(state.inning, state.half, state.outs, new_bases, new_sd)
+                # Walk-off can occur per-outcome if this run takes the lead.
+                if ns.half == "bot" and ns.inning >= 9 and ns.score_diff > 0:
+                    we_o = 1.0
+                else:
+                    we_o = get_win_expectancy(ns)
+                new_we += prob * we_o
+
+                if include_markets:
+                    if state.half == "top":
+                        nh, na = home_score, away_score + runs
+                    else:
+                        nh, na = home_score + runs, away_score
+                    for line in use_ou:
+                        ou_after_acc[str(line)] += prob * compute_over_under_probability(
+                            nh, na, ns.inning, ns.half, ns.outs, ns.runners, line,
+                        )
+                    for line in use_sp:
+                        sp_after_acc[str(line)] += prob * compute_spread_probability(
+                            nh, na, ns.inning, ns.half, ns.outs, ns.runners, line,
+                        )
+
+            if include_markets:
+                for line in use_ou:
+                    before = cur_ou[str(line)]
+                    after = ou_after_acc[str(line)]
+                    ou_dict[str(line)] = {
+                        "before": round(before, 4),
+                        "after": round(after, 4),
+                        "delta": round(after - before, 4),
+                    }
+                for line in use_sp:
+                    before = cur_sp[str(line)]
+                    after = sp_after_acc[str(line)]
+                    sp_dict[str(line)] = {
+                        "before": round(before, 4),
+                        "after": round(after, 4),
+                        "delta": round(after - before, 4),
+                    }
+
+            deltas.append(EventDelta(
+                event=event,
+                win_expectancy_before=round(current_we, 4),
+                win_expectancy_after=round(new_we, 4),
+                delta=round(new_we - current_we, 4),
+                over_under=ou_dict,
+                spread=sp_dict,
+            ))
+            continue
+
         new_we = get_win_expectancy(new_state)
 
         # Walk-off: bottom 9+, home takes the lead on THIS play → game over
@@ -442,9 +526,6 @@ def compute_deltas(
             elif new_state.score_diff < 0:
                 new_we = 0.0   # home was losing → game over, home loses
             # score_diff == 0 → tied, goes to extras (flip to top 10 is correct)
-
-        ou_dict: dict = {}
-        sp_dict: dict = {}
 
         if include_markets:
             runs = _runs_scored(state, event)

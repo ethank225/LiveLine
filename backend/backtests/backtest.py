@@ -41,6 +41,7 @@ from backtests.multi_market import (
     run_comparison, print_comparison, write_trades_csv,
 )
 from backtests.report_io import capture_report, timestamped_path
+from backtests.cache import save_game_cache, load_game_cache, list_cached_games
 
 
 def main():
@@ -77,7 +78,13 @@ def _main_inner():
                         help=f"Alpha for single/multi-market comparison (default: {DEFAULT_ALPHA}).")
     parser.add_argument("--max-dollars", type=float, default=DEFAULT_MAX_DOLLARS,
                         help=f"Per-play budget for comparison (default: ${DEFAULT_MAX_DOLLARS:.0f}).")
+    parser.add_argument("--use-cached", action="store_true",
+                        help="Skip MLB+Kalshi API calls; reload plays/trades from "
+                             "results/cache/ and rerun model + fill simulation.")
     args = parser.parse_args()
+
+    if args.use_cached and args.mlb_only:
+        print("Note: --mlb-only is implied by --use-cached when no Kalshi cache is present.")
 
     if args.multi_market and args.alpha not in ALPHAS:
         print(f"Warning: alpha={args.alpha} is not in simulated ALPHAS={ALPHAS}. "
@@ -110,7 +117,9 @@ def _main_inner():
 
     # --- Init Kalshi client ---
     kalshi_client = None
-    if not args.mlb_only:
+    if args.use_cached:
+        print("Using cached MLB + Kalshi data (skipping all API calls)")
+    elif not args.mlb_only:
         kalshi_client = get_kalshi_client()
         if kalshi_client:
             env = os.getenv("KALSHI_ENV", "demo")
@@ -125,16 +134,25 @@ def _main_inner():
     games_with_kalshi = 0
 
     for target in dates:
-        date_str = target.strftime("%m/%d/%Y")
-
-        if args.game_id:
-            game_ids = [args.game_id]
-        else:
-            games = get_games_for_date(date_str)
-            if not games:
-                print(f"\n{target.isoformat()}: no completed games")
+        if args.use_cached:
+            if args.game_id:
+                game_ids = [args.game_id]
+            else:
+                game_ids = list_cached_games(target)
+            if not game_ids:
+                print(f"\n{target.isoformat()}: no cached games found in "
+                      f"{OUTPUT_DIR / 'cache' / target.isoformat()}")
                 continue
-            game_ids = [g["game_id"] for g in games]
+        else:
+            date_str = target.strftime("%m/%d/%Y")
+            if args.game_id:
+                game_ids = [args.game_id]
+            else:
+                games = get_games_for_date(date_str)
+                if not games:
+                    print(f"\n{target.isoformat()}: no completed games")
+                    continue
+                game_ids = [g["game_id"] for g in games]
 
         print(f"\n{'=' * 70}")
         print(f"{target.isoformat()} — {len(game_ids)} game(s)")
@@ -143,11 +161,22 @@ def _main_inner():
         for game_id in game_ids:
             total_games += 1
 
-            try:
-                records, game_info = pull_play_by_play(game_id)
-            except Exception as e:
-                print(f"  [{game_id}] Failed to pull MLB data: {e}")
-                continue
+            # --- Load plays + trades + market specs (cached or live) ---
+            cached_specs: list = []
+            cached_trades: dict[str, list[tuple[int, float]]] = {}
+
+            if args.use_cached:
+                loaded = load_game_cache(target, game_id)
+                if loaded is None:
+                    print(f"  [{game_id}] no cache entry — skipping")
+                    continue
+                game_info, records, cached_specs, cached_trades = loaded
+            else:
+                try:
+                    records, game_info = pull_play_by_play(game_id)
+                except Exception as e:
+                    print(f"  [{game_id}] Failed to pull MLB data: {e}")
+                    continue
 
             total_plays += len(records)
             tag = f"{game_info['away_abbr']}@{game_info['home_abbr']}"
@@ -157,12 +186,52 @@ def _main_inner():
             if not args.quiet:
                 print_play_log(records, game_info)
 
-            # --- Resolve Kalshi markets ---
+            # --- Sync against Kalshi markets ---
             game_synced: list[dict] = []
             home_abbr = game_info["home_abbr"].upper()
             away_abbr = game_info["away_abbr"].upper()
 
-            if kalshi_client and not args.mlb_only:
+            # Collected during a live run for caching at end-of-game.
+            run_specs: list = []
+            run_trades: dict[str, list[tuple[int, float]]] = {}
+
+            if args.use_cached:
+                ml_specs = [s for s in cached_specs if s.market_type == "moneyline"]
+                ou_specs = [s for s in cached_specs if s.market_type == "over_under"]
+                spread_specs = [s for s in cached_specs if s.market_type == "spread"]
+
+                for spec in ml_specs:
+                    trades = cached_trades.get(spec.ticker)
+                    if trades:
+                        synced = sync_plays_with_trades(records, trades, spec=spec)
+                        game_synced.extend(synced)
+                        print(f"  [{tag}] {spec.label}: {len(synced)} plays "
+                              f"({len(trades)} trades, cached)")
+
+                if ou_specs:
+                    ou_trades = {sp.ticker: cached_trades[sp.ticker]
+                                 for sp in ou_specs if sp.ticker in cached_trades}
+                    if ou_trades:
+                        synced = sync_plays_dynamic_ou(records, ou_specs, ou_trades)
+                        game_synced.extend(synced)
+                        n_trades = sum(len(t) for t in ou_trades.values())
+                        print(f"  [{tag}] O/U dynamic: {len(synced)} plays "
+                              f"({len(ou_trades)} markets, {n_trades} trades, cached)")
+
+                if spread_specs:
+                    spread_trades = {sp.ticker: cached_trades[sp.ticker]
+                                     for sp in spread_specs if sp.ticker in cached_trades}
+                    if spread_trades:
+                        synced = sync_plays_dynamic_spread(records, spread_specs, spread_trades)
+                        game_synced.extend(synced)
+                        n_trades = sum(len(t) for t in spread_trades.values())
+                        print(f"  [{tag}] SPR dynamic: {len(synced)} plays "
+                              f"({len(spread_trades)} markets, {n_trades} trades, cached)")
+
+                if not (ml_specs or ou_specs or spread_specs):
+                    print(f"  [{tag}] {len(records)} plays (no cached Kalshi data)")
+
+            elif kalshi_client and not args.mlb_only:
                 day_start = int(datetime(target.year, target.month, target.day,
                                          tzinfo=timezone.utc).timestamp())
                 day_end = day_start + 36 * 3600
@@ -171,6 +240,7 @@ def _main_inner():
                     is_away = args.market_ticker.rsplit("-", 1)[-1].upper() == away_abbr
                     trades = pull_kalshi_trades(kalshi_client, args.market_ticker, day_start, day_end)
                     if trades:
+                        run_trades[args.market_ticker] = trades
                         synced = sync_plays_with_trades(records, trades, is_away_contract=is_away)
                         game_synced.extend(synced)
                         side = "away→flipped" if is_away else "home"
@@ -183,6 +253,7 @@ def _main_inner():
 
                     if evt:
                         specs = discover_game_markets(kalshi_client, evt, home_abbr, away_abbr)
+                        run_specs.extend(specs)
                         ml_specs = [s for s in specs if s.market_type == "moneyline"]
                         ou_specs = [s for s in specs if s.market_type == "over_under"]
                         spread_specs = [s for s in specs if s.market_type == "spread"]
@@ -190,6 +261,7 @@ def _main_inner():
                         for spec in ml_specs:
                             trades = pull_kalshi_trades(kalshi_client, spec.ticker, day_start, day_end)
                             if trades:
+                                run_trades[spec.ticker] = trades
                                 synced = sync_plays_with_trades(records, trades, spec=spec)
                                 game_synced.extend(synced)
                                 print(f"  [{tag}] {spec.label}: {len(synced)} plays ({len(trades)} trades)")
@@ -200,6 +272,7 @@ def _main_inner():
                                 tr = pull_kalshi_trades(kalshi_client, sp.ticker, day_start, day_end)
                                 if tr:
                                     ou_trades[sp.ticker] = tr
+                                    run_trades[sp.ticker] = tr
                             if ou_trades:
                                 synced = sync_plays_dynamic_ou(records, ou_specs, ou_trades)
                                 game_synced.extend(synced)
@@ -213,6 +286,7 @@ def _main_inner():
                                 tr = pull_kalshi_trades(kalshi_client, sp.ticker, day_start, day_end)
                                 if tr:
                                     spread_trades[sp.ticker] = tr
+                                    run_trades[sp.ticker] = tr
                             if spread_trades:
                                 synced = sync_plays_dynamic_spread(records, spread_specs, spread_trades)
                                 game_synced.extend(synced)
@@ -221,17 +295,22 @@ def _main_inner():
                                       f"({len(spread_trades)} markets, {n_trades} trades)")
                     else:
                         print(f"  [{tag}] no Kalshi event found")
-
-                if game_synced:
-                    games_with_kalshi += 1
-                    game_tag = f"{game_id} {tag}"
-                    for r in game_synced:
-                        r["game_tag"] = game_tag
-                    all_synced.extend(game_synced)
             else:
                 print(f"  [{tag}] {len(records)} plays (MLB only)")
 
+            if game_synced:
+                games_with_kalshi += 1
+                game_tag = f"{game_id} {tag}"
+                for r in game_synced:
+                    r["game_tag"] = game_tag
+                all_synced.extend(game_synced)
+
             save_csv(records, game_info, game_synced)
+
+            # Persist raw inputs so future runs can replay with --use-cached.
+            if not args.use_cached:
+                save_game_cache(target, game_id, game_info, records,
+                                run_specs, run_trades)
 
     # --- Combined summary ---
     print(f"\n{'=' * 70}")

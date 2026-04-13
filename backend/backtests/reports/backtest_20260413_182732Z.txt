@@ -1,0 +1,797 @@
+Backtesting 3 day(s): 2026-04-08 — 2026-04-10
+Entry offset: 5s before event | Exit window: 30s after event
+Kalshi connected (prod)
+
+======================================================================
+2026-04-08 — 15 game(s)
+======================================================================
+Cached 2482 KXMLBGAME events from Kalshi
+  [SD@PIT] ML PIT: 77 plays (9431 trades)
+  [SD@PIT] O/U dynamic: 63 plays (11 markets, 6580 trades)
+  [SD@PIT] SPR dynamic: 77 plays (8 markets, 3768 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/SD_PIT_823403_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/SD_PIT_823403_synced.csv
+  [KC@CLE] ML CLE: 76 plays (3611 trades)
+  [KC@CLE] O/U dynamic: 65 plays (13 markets, 4531 trades)
+  [KC@CLE] SPR dynamic: 76 plays (9 markets, 1965 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/KC_CLE_824455_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/KC_CLE_824455_synced.csv
+  [MIL@BOS] ML BOS: 73 plays (3848 trades)
+  [MIL@BOS] O/U dynamic: 66 plays (11 markets, 3476 trades)
+  [MIL@BOS] SPR dynamic: 73 plays (8 markets, 2525 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/MIL_BOS_824779_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/MIL_BOS_824779_synced.csv
+  [BAL@CWS] ML CWS: 80 plays (5317 trades)
+  [BAL@CWS] O/U dynamic: 58 plays (11 markets, 3165 trades)
+  [BAL@CWS] SPR dynamic: 71 plays (7 markets, 1844 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/BAL_CWS_824617_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/BAL_CWS_824617_synced.csv
+  [SEA@TEX] ML TEX: 61 plays (3475 trades)
+  [SEA@TEX] O/U dynamic: 53 plays (11 markets, 3262 trades)
+  [SEA@TEX] SPR dynamic: 56 plays (8 markets, 1461 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/SEA_TEX_822915_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/SEA_TEX_822915_synced.csv
+  [LAD@TOR] ML TOR: 78 plays (8927 trades)
+  [LAD@TOR] O/U dynamic: 53 plays (11 markets, 5420 trades)
+  [LAD@TOR] SPR dynamic: 75 plays (6 markets, 5194 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/LAD_TOR_822833_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/LAD_TOR_822833_synced.csv
+  [HOU@COL] ML COL: 81 plays (2348 trades)
+  [HOU@COL] O/U dynamic: 68 plays (11 markets, 4314 trades)
+  [HOU@COL] SPR dynamic: 68 plays (11 markets, 2476 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/HOU_COL_824374_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/HOU_COL_824374_synced.csv
+  [PHI@SF] ML SF: 70 plays (3885 trades)
+  [PHI@SF] O/U dynamic: 64 plays (11 markets, 2956 trades)
+  [PHI@SF] SPR dynamic: 66 plays (7 markets, 1645 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/PHI_SF_823234_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/PHI_SF_823234_synced.csv
+  [STL@WSH] ML WSH: 71 plays (1996 trades)
+  [STL@WSH] O/U dynamic: 56 plays (11 markets, 4032 trades)
+  [STL@WSH] SPR dynamic: 64 plays (7 markets, 1921 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/STL_WSH_822753_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/STL_WSH_822753_synced.csv
+  [ATL@LAA] ML LAA: 78 plays (2347 trades)
+  [ATL@LAA] O/U dynamic: 64 plays (13 markets, 2859 trades)
+  [ATL@LAA] SPR dynamic: 70 plays (10 markets, 1892 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/ATL_LAA_824050_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/ATL_LAA_824050_synced.csv
+  [AZ@NYM] ML NYM: 78 plays (3003 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/AZ_NYM_823646_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/AZ_NYM_823646_synced.csv
+  [CHC@TB] ML TB: 71 plays (4057 trades)
+  [CHC@TB] O/U dynamic: 52 plays (11 markets, 3613 trades)
+  [CHC@TB] SPR dynamic: 65 plays (10 markets, 1868 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/CHC_TB_823000_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/CHC_TB_823000_synced.csv
+  [CIN@MIA] ML MIA: 76 plays (5212 trades)
+  [CIN@MIA] O/U dynamic: 56 plays (15 markets, 3251 trades)
+  [CIN@MIA] SPR dynamic: 73 plays (10 markets, 2076 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/CIN_MIA_823885_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/CIN_MIA_823885_synced.csv
+  [ATH@NYY] ML NYY: 77 plays (13943 trades)
+  [ATH@NYY] O/U dynamic: 32 plays (11 markets, 3946 trades)
+  [ATH@NYY] SPR dynamic: 77 plays (7 markets, 4920 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/ATH_NYY_823564_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/ATH_NYY_823564_synced.csv
+  [DET@MIN] ML MIN: 85 plays (4335 trades)
+  [DET@MIN] O/U dynamic: 77 plays (15 markets, 3857 trades)
+  [DET@MIN] SPR dynamic: 55 plays (12 markets, 3279 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/DET_MIN_823726_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/DET_MIN_823726_synced.csv
+
+======================================================================
+2026-04-09 — 6 game(s)
+======================================================================
+  [CIN@MIA] ML MIA: 79 plays (5974 trades)
+  [CIN@MIA] O/U dynamic: 60 plays (11 markets, 5745 trades)
+  [CIN@MIA] SPR dynamic: 77 plays (9 markets, 3329 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/CIN_MIA_823884_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/CIN_MIA_823884_synced.csv
+  [ATH@NYY] ML NYY: 66 plays (13844 trades)
+  [ATH@NYY] O/U dynamic: 55 plays (11 markets, 4263 trades)
+  [ATH@NYY] SPR dynamic: 66 plays (6 markets, 3614 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/ATH_NYY_823565_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/ATH_NYY_823565_synced.csv
+  [DET@MIN] ML MIN: 72 plays (8406 trades)
+  [DET@MIN] O/U dynamic: 42 plays (11 markets, 5460 trades)
+  [DET@MIN] SPR dynamic: 71 plays (6 markets, 2506 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/DET_MIN_823724_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/DET_MIN_823724_synced.csv
+  [AZ@NYM] ML NYM: 72 plays (5894 trades)
+  [AZ@NYM] O/U dynamic: 65 plays (11 markets, 4423 trades)
+  [AZ@NYM] SPR dynamic: 71 plays (9 markets, 2881 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/AZ_NYM_823645_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/AZ_NYM_823645_synced.csv
+  [CWS@KC] ML KC: 73 plays (6514 trades)
+  [CWS@KC] O/U dynamic: 56 plays (11 markets, 3819 trades)
+  [CWS@KC] SPR dynamic: 73 plays (6 markets, 2715 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/CWS_KC_824130_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/CWS_KC_824130_synced.csv
+  [COL@SD] ML SD: 97 plays (24610 trades)
+  [COL@SD] O/U dynamic: 66 plays (12 markets, 11767 trades)
+  [COL@SD] SPR dynamic: 97 plays (8 markets, 8448 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/COL_SD_823319_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/COL_SD_823319_synced.csv
+
+======================================================================
+2026-04-10 — 15 game(s)
+======================================================================
+  [PIT@CHC] ML CHC: 69 plays (12000 trades)
+  [PIT@CHC] O/U dynamic: 61 plays (10 markets, 8180 trades)
+  [PIT@CHC] SPR dynamic: 69 plays (6 markets, 5106 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/PIT_CHC_824695_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/PIT_CHC_824695_synced.csv
+  [AZ@PHI] ML PHI: 74 plays (5285 trades)
+  [AZ@PHI] O/U dynamic: 66 plays (12 markets, 3104 trades)
+  [AZ@PHI] SPR dynamic: 65 plays (9 markets, 2370 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/AZ_PHI_823482_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/AZ_PHI_823482_synced.csv
+  [MIA@DET] ML DET: 62 plays (3765 trades)
+  [MIA@DET] O/U dynamic: 46 plays (11 markets, 2598 trades)
+  [MIA@DET] SPR dynamic: 62 plays (7 markets, 1402 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/MIA_DET_824297_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/MIA_DET_824297_synced.csv
+  [LAA@CIN] ML CIN: 74 plays (3095 trades)
+  [LAA@CIN] O/U dynamic: 67 plays (11 markets, 2556 trades)
+  [LAA@CIN] SPR dynamic: 74 plays (12 markets, 1659 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/LAA_CIN_824534_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/LAA_CIN_824534_synced.csv
+  [MIN@TOR] ML TOR: 78 plays (2308 trades)
+  [MIN@TOR] O/U dynamic: 61 plays (14 markets, 1635 trades)
+  [MIN@TOR] SPR dynamic: 74 plays (12 markets, 1191 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/MIN_TOR_822829_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/MIN_TOR_822829_synced.csv
+  [ATH@NYM] ML NYM: 70 plays (3844 trades)
+  [ATH@NYM] O/U dynamic: 62 plays (11 markets, 1816 trades)
+  [ATH@NYM] SPR dynamic: 60 plays (6 markets, 1233 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/ATH_NYM_823643_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/ATH_NYM_823643_synced.csv
+  [NYY@TB] ML TB: 74 plays (3393 trades)
+  [NYY@TB] O/U dynamic: 50 plays (13 markets, 2321 trades)
+  [NYY@TB] SPR dynamic: 73 plays (8 markets, 2093 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/NYY_TB_822997_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/NYY_TB_822997_synced.csv
+  [SF@BAL] ML BAL: 79 plays (1859 trades)
+  [SF@BAL] O/U dynamic: 56 plays (11 markets, 1660 trades)
+  [SF@BAL] SPR dynamic: 75 plays (9 markets, 884 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/SF_BAL_824858_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/SF_BAL_824858_synced.csv
+  [CLE@ATL] ML ATL: 80 plays (3445 trades)
+  [CLE@ATL] O/U dynamic: 64 plays (14 markets, 1648 trades)
+  [CLE@ATL] SPR dynamic: 74 plays (9 markets, 1433 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/CLE_ATL_824941_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/CLE_ATL_824941_synced.csv
+  [CWS@KC] ML KC: 59 plays (1204 trades)
+  [CWS@KC] O/U dynamic: 33 plays (11 markets, 1191 trades)
+  [CWS@KC] SPR dynamic: 56 plays (6 markets, 587 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/CWS_KC_824128_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/CWS_KC_824128_synced.csv
+  [WSH@MIL] ML MIL: 74 plays (5322 trades)
+  [WSH@MIL] O/U dynamic: 41 plays (13 markets, 2648 trades)
+  [WSH@MIL] SPR dynamic: 74 plays (7 markets, 2371 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/WSH_MIL_823808_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/WSH_MIL_823808_synced.csv
+  [BOS@STL] ML STL: 73 plays (4499 trades)
+  [BOS@STL] O/U dynamic: 37 plays (11 markets, 2553 trades)
+  [BOS@STL] SPR dynamic: 63 plays (6 markets, 1154 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/BOS_STL_823076_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/BOS_STL_823076_synced.csv
+  [COL@SD] ML SD: 67 plays (4870 trades)
+  [COL@SD] O/U dynamic: 48 plays (11 markets, 2740 trades)
+  [COL@SD] SPR dynamic: 67 plays (7 markets, 2090 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/COL_SD_823318_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/COL_SD_823318_synced.csv
+  [HOU@SEA] ML SEA: 81 plays (5521 trades)
+  [HOU@SEA] O/U dynamic: 53 plays (16 markets, 4202 trades)
+  [HOU@SEA] SPR dynamic: 80 plays (10 markets, 3092 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/HOU_SEA_823156_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/HOU_SEA_823156_synced.csv
+  [TEX@LAD] ML LAD: 80 plays (13825 trades)
+  [TEX@LAD] O/U dynamic: 73 plays (11 markets, 4109 trades)
+  [TEX@LAD] SPR dynamic: 80 plays (7 markets, 6480 trades)
+
+Saved play-by-play: /Users/ethan/Desktop/LiveLine/backend/backtests/results/TEX_LAD_823968_plays.csv
+Saved synced data:  /Users/ethan/Desktop/LiveLine/backend/backtests/results/TEX_LAD_823968_synced.csv
+
+======================================================================
+COMBINED RESULTS — 36 games, 2696 plays
+======================================================================
+Games with Kalshi data: 36
+
+============================================================
+TIME BETWEEN EVENTS
+============================================================
+
+  At-bat to at-bat (result → result) (n=7041):
+    Average: 131s (2.2 min)  |  Median: 114s  |  P25: 74s  |  P75: 176s
+          Window  Count      %  Implication
+    -------------------------------------------------------
+           0-15s      7   0.1%  ← windows past this contaminated
+          15-30s    127   1.8%  ← windows past this contaminated
+          30-60s    991  14.1%  
+         60-120s   2576  36.6%  ← clean through t+55s
+        120-300s   3206  45.5%  ← clean through t+115s
+           300s+    134   1.9%  ← clean through t+295s
+
+  At-bat to next pitch (result → first pitch of next AB) (n=7041):
+    Average: 143s (2.4 min)  |  Median: 129s  |  P25: 89s  |  P75: 188s
+          Window  Count      %  Implication
+    -------------------------------------------------------
+           0-15s      0   0.0%  ← windows past this contaminated
+          15-30s      6   0.1%  ← windows past this contaminated
+          30-60s    589   8.4%  
+         60-120s   2563  36.4%  ← clean through t+55s
+        120-300s   3719  52.8%  ← clean through t+115s
+           300s+    164   2.3%  ← clean through t+295s
+
+======================================================================
+BACKTEST ACCURACY — Model vs Kalshi Price Moves
+======================================================================
+
+MONEYLINE — ALL (36 markets)
+  Plays: 2685  |  Bias: -0.0013  |  MAE: 0.0296  |  RMSE: 0.0465  |  Dir: 56.1%
+  Event Count     Pred   Actual     MAE   Dir%
+  ---------------------------------------------
+     HR    50  +0.0302  +0.0048  0.1048    61%
+     2B   129  -0.0080  +0.0069  0.0569    59%
+     1B   385  +0.0021  -0.0013  0.0454    55%
+     BB   295  +0.0036  +0.0007  0.0346    47%
+     DP    59  -0.0013  -0.0058  0.0543    47%
+    OUT  1195  -0.0005  -0.0011  0.0198    60%
+      K   572  +0.0017  -0.0001  0.0216    52%
+
+MONEYLINE — HIGH LEVERAGE (1937 plays, |delta| >= 0.01)
+  Plays: 1937  |  Bias: -0.0016  |  MAE: 0.0374  |  RMSE: 0.0540  |  Dir: 57.7%
+  Event Count     Pred   Actual     MAE   Dir%
+  ---------------------------------------------
+     HR    47  +0.0319  +0.0051  0.1113    64%
+     2B   113  -0.0092  +0.0078  0.0641    61%
+     1B   316  +0.0023  -0.0019  0.0540    57%
+     BB   230  +0.0046  +0.0009  0.0418    47%
+     DP    48  -0.0020  -0.0071  0.0652    52%
+    OUT   795  -0.0011  -0.0013  0.0245    63%
+      K   388  +0.0023  -0.0005  0.0275    52%
+
+OVER_UNDER — ALL (193 dynamic lines)
+  Plays: 1989  |  Bias: -0.0074  |  MAE: 0.0490  |  RMSE: 0.0843  |  Dir: 63.9%
+  Event Count     Pred   Actual     MAE   Dir%
+  ---------------------------------------------
+     HR    49  +0.1364  +0.0716  0.1022    59%
+     2B    99  +0.0676  +0.0243  0.0671    44%
+     1B   303  +0.0663  +0.0189  0.0722    48%
+     BB   210  +0.0293  +0.0040  0.0477    43%
+     DP    43  -0.0795  -0.0074  0.0963    65%
+    OUT   885  -0.0143  -0.0113  0.0378    73%
+      K   400  -0.0239  -0.0076  0.0410    72%
+
+OVER_UNDER — HIGH LEVERAGE (1908 plays, total within 3 of line)
+  Plays: 1908  |  Bias: -0.0069  |  MAE: 0.0494  |  RMSE: 0.0854  |  Dir: 64.1%
+  Event Count     Pred   Actual     MAE   Dir%
+  ---------------------------------------------
+     HR    46  +0.1398  +0.0743  0.1050    60%
+     2B    96  +0.0678  +0.0239  0.0685    43%
+     1B   284  +0.0673  +0.0197  0.0737    47%
+     BB   202  +0.0294  +0.0043  0.0481    43%
+     DP    43  -0.0795  -0.0074  0.0963    65%
+    OUT   850  -0.0145  -0.0112  0.0378    74%
+      K   387  -0.0243  -0.0068  0.0411    72%
+
+SPREAD — ALL (136 markets)
+  Plays: 2467  |  Bias: -0.0036  |  MAE: 0.0556  |  RMSE: 0.0935  |  Dir: 58.4%
+  Event Count     Pred   Actual     MAE   Dir%
+  ---------------------------------------------
+     HR    50  +0.0835  +0.0354  0.1857    69%
+     2B   120  +0.0163  +0.0067  0.0775    64%
+     1B   350  +0.0242  +0.0114  0.0805    57%
+     BB   276  +0.0149  -0.0058  0.0525    50%
+     DP    56  -0.0092  +0.0129  0.0817    50%
+    OUT  1089  -0.0052  -0.0034  0.0457    60%
+      K   526  -0.0027  +0.0004  0.0411    60%
+
+SPREAD — HIGH LEVERAGE (1811 plays, |delta| >= 0.01)
+  Plays: 1811  |  Bias: -0.0040  |  MAE: 0.0513  |  RMSE: 0.0808  |  Dir: 58.0%
+  Event Count     Pred   Actual     MAE   Dir%
+  ---------------------------------------------
+     HR    47  +0.0664  +0.0255  0.1626    70%
+     2B   107  +0.0103  -0.0006  0.0722    65%
+     1B   289  +0.0193  +0.0082  0.0741    57%
+     BB   219  +0.0141  -0.0067  0.0475    52%
+     DP    46  -0.0122  +0.0059  0.0785    50%
+    OUT   740  -0.0047  -0.0020  0.0389    59%
+      K   363  -0.0019  +0.0004  0.0368    58%
+
+======================================================================
+TIMING ANALYSIS — Entry at t-5s
+======================================================================
+
+======================================================================
+MONEYLINE — ALL (36 markets)
+
+  HR (50 events):  predicted=+0.0302
+    Peak: +0.0224 at 50-75%
+       0-10%: -0.0021  (  9.2%)  dir= 59%  n=34
+      10-25%: +0.0012  (  5.2%)  dir= 58%  n=43
+      25-50%: +0.0039  ( 17.2%)  dir= 66%  n=44
+      50-75%: +0.0224  (100.0%)  dir= 82%  n=45 ← peak
+     75-100%: +0.0187  ( 83.2%)  dir= 98%  n=45
+
+  2B (129 events):  predicted=-0.0080
+    Peak: -0.0051 at 75-100%
+       0-10%: +0.0010  ( 20.4%)  dir= 47%  n=96
+      10-25%: +0.0035  ( 69.2%)  dir= 44%  n=113
+      25-50%: +0.0064  (125.5%)  dir= 60%  n=123
+      50-75%: +0.0071  (139.0%)  dir= 69%  n=128
+     75-100%: -0.0051  (100.0%)  dir= 88%  n=129 ← peak
+
+  1B (385 events):  predicted=+0.0021
+    Peak: -0.0000 at 75-100%
+       0-10%: -0.0015  (  0.0%)  dir= 49%  n=273
+      10-25%: -0.0024  (  0.0%)  dir= 49%  n=348
+      25-50%: -0.0006  (  0.0%)  dir= 52%  n=367
+      50-75%: -0.0008  (  0.0%)  dir= 64%  n=374
+     75-100%: -0.0000  (  0.0%)  dir= 78%  n=378 ← peak
+
+  BB (295 events):  predicted=+0.0036
+    Peak: +0.0023 at 75-100%
+       0-10%: -0.0005  ( 20.3%)  dir= 43%  n=238
+      10-25%: -0.0008  ( 36.6%)  dir= 44%  n=276
+      25-50%: -0.0002  ( 10.7%)  dir= 52%  n=288
+      50-75%: +0.0003  ( 13.5%)  dir= 59%  n=292
+     75-100%: +0.0023  (100.0%)  dir= 74%  n=294 ← peak
+
+  DP (59 events):  predicted=-0.0013
+    Peak: -0.0216 at 50-75%
+       0-10%: -0.0055  ( 25.6%)  dir= 47%  n=49
+      10-25%: -0.0075  ( 35.0%)  dir= 53%  n=53
+      25-50%: -0.0193  ( 89.6%)  dir= 67%  n=58
+      50-75%: -0.0216  (100.0%)  dir= 67%  n=58 ← peak
+     75-100%: -0.0159  ( 73.9%)  dir= 76%  n=59
+
+  OUT (1195 events):  predicted=-0.0005
+    Peak: -0.0014 at 75-100%
+       0-10%: -0.0011  ( 76.5%)  dir= 55%  n=824
+      10-25%: -0.0011  ( 76.8%)  dir= 57%  n=1065
+      25-50%: -0.0003  ( 22.1%)  dir= 62%  n=1145
+      50-75%: -0.0007  ( 47.5%)  dir= 68%  n=1158
+     75-100%: -0.0014  (100.0%)  dir= 77%  n=1166 ← peak
+
+  K (572 events):  predicted=+0.0017
+    Peak: +0.0001 at 75-100%
+       0-10%: -0.0004  (  0.0%)  dir= 49%  n=461
+      10-25%: -0.0005  (  0.0%)  dir= 53%  n=528
+      25-50%: -0.0007  (  0.0%)  dir= 61%  n=552
+      50-75%: -0.0001  (  0.0%)  dir= 63%  n=555
+     75-100%: +0.0001  (  0.0%)  dir= 71%  n=556 ← peak
+
+  Event Count  Predicted     Peak   Peak @  Best Dir    Dir @
+  ------------------------------------------------------------
+     HR    50    +0.0302  +0.0224   50-75%       98%  75-100%
+     2B   129    -0.0080  -0.0051  75-100%       88%  75-100%
+     1B   385    +0.0021  -0.0000  75-100%       78%  75-100%
+     BB   295    +0.0036  +0.0023  75-100%       74%  75-100%
+     DP    59    -0.0013  -0.0216   50-75%       76%  75-100%
+    OUT  1195    -0.0005  -0.0014  75-100%       77%  75-100%
+      K   572    +0.0017  +0.0001  75-100%       71%  75-100%
+
+======================================================================
+MONEYLINE — HIGH LEVERAGE (1937 plays, |delta| >= 0.01)
+
+  HR (47 events):  predicted=+0.0319
+    Peak: +0.0230 at 50-75%
+       0-10%: -0.0021  (  9.2%)  dir= 61%  n=33
+      10-25%: +0.0012  (  5.2%)  dir= 60%  n=42
+      25-50%: +0.0040  ( 17.2%)  dir= 67%  n=43
+      50-75%: +0.0230  (100.0%)  dir= 84%  n=44 ← peak
+     75-100%: +0.0191  ( 83.2%)  dir=100%  n=44
+
+  2B (113 events):  predicted=-0.0092
+    Peak: -0.0061 at 75-100%
+       0-10%: +0.0012  ( 19.3%)  dir= 45%  n=85
+      10-25%: +0.0040  ( 64.9%)  dir= 44%  n=101
+      25-50%: +0.0072  (117.2%)  dir= 61%  n=109
+      50-75%: +0.0081  (133.1%)  dir= 71%  n=112
+     75-100%: -0.0061  (100.0%)  dir= 94%  n=113 ← peak
+
+  1B (316 events):  predicted=+0.0023
+    Peak: -0.0000 at 75-100%
+       0-10%: -0.0019  (  0.0%)  dir= 50%  n=240
+      10-25%: -0.0028  (  0.0%)  dir= 50%  n=301
+      25-50%: -0.0007  (  0.0%)  dir= 53%  n=312
+      50-75%: -0.0011  (  0.0%)  dir= 67%  n=315
+     75-100%: -0.0000  (  0.0%)  dir= 84%  n=316 ← peak
+
+  BB (230 events):  predicted=+0.0046
+    Peak: +0.0030 at 75-100%
+       0-10%: -0.0008  ( 24.9%)  dir= 43%  n=198
+      10-25%: -0.0011  ( 35.8%)  dir= 44%  n=220
+      25-50%: -0.0002  (  7.2%)  dir= 52%  n=227
+      50-75%: +0.0002  (  7.2%)  dir= 61%  n=229
+     75-100%: +0.0030  (100.0%)  dir= 80%  n=230 ← peak
+
+  DP (48 events):  predicted=-0.0020
+    Peak: -0.0260 at 50-75%
+       0-10%: -0.0061  ( 23.6%)  dir= 48%  n=44
+      10-25%: -0.0087  ( 33.4%)  dir= 57%  n=46
+      25-50%: -0.0233  ( 89.6%)  dir= 75%  n=48
+      50-75%: -0.0260  (100.0%)  dir= 75%  n=48 ← peak
+     75-100%: -0.0198  ( 76.0%)  dir= 88%  n=48
+
+  OUT (795 events):  predicted=-0.0011
+    Peak: -0.0022 at 75-100%
+       0-10%: -0.0013  ( 58.2%)  dir= 55%  n=563
+      10-25%: -0.0014  ( 64.9%)  dir= 58%  n=733
+      25-50%: -0.0012  ( 55.5%)  dir= 62%  n=776
+      50-75%: -0.0015  ( 68.1%)  dir= 68%  n=784
+     75-100%: -0.0022  (100.0%)  dir= 82%  n=790 ← peak
+
+  K (388 events):  predicted=+0.0023
+    Peak: -0.0005 at 50-75%
+       0-10%: -0.0009  (168.8%)  dir= 48%  n=329
+      10-25%: -0.0007  (139.0%)  dir= 51%  n=372
+      25-50%: -0.0011  (205.5%)  dir= 61%  n=382
+      50-75%: -0.0005  (100.0%)  dir= 63%  n=383 ← peak
+     75-100%: -0.0006  (120.0%)  dir= 75%  n=383
+
+  Event Count  Predicted     Peak   Peak @  Best Dir    Dir @
+  ------------------------------------------------------------
+     HR    47    +0.0319  +0.0230   50-75%      100%  75-100%
+     2B   113    -0.0092  -0.0061  75-100%       94%  75-100%
+     1B   316    +0.0023  -0.0000  75-100%       84%  75-100%
+     BB   230    +0.0046  +0.0030  75-100%       80%  75-100%
+     DP    48    -0.0020  -0.0260   50-75%       88%  75-100%
+    OUT   795    -0.0011  -0.0022  75-100%       82%  75-100%
+      K   388    +0.0023  -0.0005   50-75%       75%  75-100%
+
+======================================================================
+OVER_UNDER — ALL (193 dynamic lines)
+
+  HR (49 events):  predicted=+0.1364
+    Peak: +0.1493 at 75-100%
+       0-10%: -0.0243  ( 16.3%)  dir= 33%  n=7
+      10-25%: +0.0093  (  6.3%)  dir= 29%  n=15
+      25-50%: +0.1115  ( 74.7%)  dir= 47%  n=20
+      50-75%: +0.1438  ( 96.3%)  dir= 75%  n=29
+     75-100%: +0.1493  (100.0%)  dir= 89%  n=40 ← peak
+
+  2B (99 events):  predicted=+0.0676
+    Peak: +0.1045 at 75-100%
+       0-10%: +0.0245  ( 23.4%)  dir= 50%  n=20
+      10-25%: +0.0162  ( 15.5%)  dir= 39%  n=37
+      25-50%: +0.0362  ( 34.6%)  dir= 40%  n=52
+      50-75%: +0.0849  ( 81.3%)  dir= 61%  n=67
+     75-100%: +0.1045  (100.0%)  dir= 63%  n=78 ← peak
+
+  1B (303 events):  predicted=+0.0663
+    Peak: +0.0641 at 75-100%
+       0-10%: -0.0094  ( 14.6%)  dir= 35%  n=66
+      10-25%: +0.0002  (  0.3%)  dir= 35%  n=119
+      25-50%: +0.0149  ( 23.3%)  dir= 47%  n=173
+      50-75%: +0.0465  ( 72.5%)  dir= 58%  n=208
+     75-100%: +0.0641  (100.0%)  dir= 66%  n=227 ← peak
+
+  BB (210 events):  predicted=+0.0293
+    Peak: +0.0152 at 75-100%
+       0-10%: -0.0043  ( 28.3%)  dir= 32%  n=51
+      10-25%: -0.0064  ( 42.3%)  dir= 33%  n=90
+      25-50%: -0.0022  ( 14.2%)  dir= 41%  n=125
+      50-75%: +0.0018  ( 11.9%)  dir= 41%  n=143
+     75-100%: +0.0152  (100.0%)  dir= 48%  n=157 ← peak
+
+  DP (43 events):  predicted=-0.0795
+    Peak: -0.0754 at 75-100%
+       0-10%: +0.0273  ( 36.2%)  dir= 46%  n=15
+      10-25%: +0.0105  ( 13.9%)  dir= 59%  n=20
+      25-50%: -0.0447  ( 59.2%)  dir= 59%  n=30
+      50-75%: -0.0635  ( 84.2%)  dir= 74%  n=34
+     75-100%: -0.0754  (100.0%)  dir= 78%  n=35 ← peak
+
+  OUT (885 events):  predicted=-0.0143
+    Peak: -0.0219 at 75-100%
+       0-10%: -0.0008  (  3.8%)  dir= 66%  n=192
+      10-25%: -0.0102  ( 46.6%)  dir= 74%  n=322
+      25-50%: -0.0175  ( 79.6%)  dir= 75%  n=451
+      50-75%: -0.0165  ( 75.3%)  dir= 74%  n=552
+     75-100%: -0.0219  (100.0%)  dir= 77%  n=608 ← peak
+
+  K (400 events):  predicted=-0.0239
+    Peak: -0.0259 at 75-100%
+       0-10%: +0.0112  ( 43.0%)  dir= 60%  n=139
+      10-25%: +0.0009  (  3.5%)  dir= 64%  n=196
+      25-50%: -0.0104  ( 39.9%)  dir= 71%  n=255
+      50-75%: -0.0175  ( 67.6%)  dir= 70%  n=284
+     75-100%: -0.0259  (100.0%)  dir= 74%  n=305 ← peak
+
+  Event Count  Predicted     Peak   Peak @  Best Dir    Dir @
+  ------------------------------------------------------------
+     HR    49    +0.1364  +0.1493  75-100%       89%  75-100%
+     2B    99    +0.0676  +0.1045  75-100%       63%  75-100%
+     1B   303    +0.0663  +0.0641  75-100%       66%  75-100%
+     BB   210    +0.0293  +0.0152  75-100%       48%  75-100%
+     DP    43    -0.0795  -0.0754  75-100%       78%  75-100%
+    OUT   885    -0.0143  -0.0219  75-100%       77%  75-100%
+      K   400    -0.0239  -0.0259  75-100%       74%  75-100%
+
+======================================================================
+OVER_UNDER — HIGH LEVERAGE (1908 plays, total within 3 of line)
+
+  HR (46 events):  predicted=+0.1398
+    Peak: +0.1578 at 75-100%
+       0-10%: -0.0243  ( 15.4%)  dir= 33%  n=7
+      10-25%: +0.0107  (  6.8%)  dir= 31%  n=14
+      25-50%: +0.1179  ( 74.7%)  dir= 50%  n=19
+      50-75%: +0.1493  ( 94.6%)  dir= 78%  n=28
+     75-100%: +0.1578  (100.0%)  dir= 91%  n=37 ← peak
+
+  2B (96 events):  predicted=+0.0678
+    Peak: +0.1061 at 75-100%
+       0-10%: +0.0245  ( 23.1%)  dir= 50%  n=20
+      10-25%: +0.0162  ( 15.3%)  dir= 39%  n=37
+      25-50%: +0.0362  ( 34.1%)  dir= 40%  n=52
+      50-75%: +0.0865  ( 81.5%)  dir= 62%  n=66
+     75-100%: +0.1061  (100.0%)  dir= 64%  n=77 ← peak
+
+  1B (284 events):  predicted=+0.0673
+    Peak: +0.0673 at 75-100%
+       0-10%: -0.0098  ( 14.6%)  dir= 34%  n=65
+      10-25%: +0.0007  (  1.0%)  dir= 34%  n=115
+      25-50%: +0.0159  ( 23.6%)  dir= 47%  n=165
+      50-75%: +0.0489  ( 72.7%)  dir= 59%  n=197
+     75-100%: +0.0673  (100.0%)  dir= 65%  n=214 ← peak
+
+  BB (202 events):  predicted=+0.0294
+    Peak: +0.0158 at 75-100%
+       0-10%: -0.0047  ( 29.7%)  dir= 31%  n=49
+      10-25%: -0.0058  ( 36.8%)  dir= 33%  n=86
+      25-50%: -0.0021  ( 13.3%)  dir= 41%  n=119
+      50-75%: +0.0022  ( 13.9%)  dir= 41%  n=137
+     75-100%: +0.0158  (100.0%)  dir= 48%  n=150 ← peak
+
+  DP (43 events):  predicted=-0.0795
+    Peak: -0.0754 at 75-100%
+       0-10%: +0.0273  ( 36.2%)  dir= 46%  n=15
+      10-25%: +0.0105  ( 13.9%)  dir= 59%  n=20
+      25-50%: -0.0447  ( 59.2%)  dir= 59%  n=30
+      50-75%: -0.0635  ( 84.2%)  dir= 74%  n=34
+     75-100%: -0.0754  (100.0%)  dir= 78%  n=35 ← peak
+
+  OUT (850 events):  predicted=-0.0145
+    Peak: -0.0221 at 75-100%
+       0-10%: -0.0005  (  2.1%)  dir= 66%  n=191
+      10-25%: -0.0100  ( 45.1%)  dir= 74%  n=318
+      25-50%: -0.0177  ( 79.9%)  dir= 76%  n=443
+      50-75%: -0.0165  ( 74.8%)  dir= 74%  n=541
+     75-100%: -0.0221  (100.0%)  dir= 77%  n=593 ← peak
+
+  K (387 events):  predicted=-0.0243
+    Peak: -0.0261 at 75-100%
+       0-10%: +0.0108  ( 41.4%)  dir= 61%  n=138
+      10-25%: +0.0009  (  3.6%)  dir= 64%  n=193
+      25-50%: -0.0105  ( 40.1%)  dir= 71%  n=252
+      50-75%: -0.0176  ( 67.6%)  dir= 70%  n=279
+     75-100%: -0.0261  (100.0%)  dir= 74%  n=300 ← peak
+
+  Event Count  Predicted     Peak   Peak @  Best Dir    Dir @
+  ------------------------------------------------------------
+     HR    46    +0.1398  +0.1578  75-100%       91%  75-100%
+     2B    96    +0.0678  +0.1061  75-100%       64%  75-100%
+     1B   284    +0.0673  +0.0673  75-100%       65%  75-100%
+     BB   202    +0.0294  +0.0158  75-100%       48%  75-100%
+     DP    43    -0.0795  -0.0754  75-100%       78%  75-100%
+    OUT   850    -0.0145  -0.0221  75-100%       77%  75-100%
+      K   387    -0.0243  -0.0261  75-100%       74%  75-100%
+
+======================================================================
+SPREAD — ALL (136 markets)
+
+  HR (50 events):  predicted=+0.0835
+    Peak: +0.0930 at 75-100%
+       0-10%: -0.0129  ( 13.8%)  dir= 36%  n=14
+      10-25%: -0.0032  (  3.4%)  dir= 55%  n=22
+      25-50%: +0.0171  ( 18.4%)  dir= 63%  n=35
+      50-75%: +0.0346  ( 37.3%)  dir= 78%  n=41
+     75-100%: +0.0930  (100.0%)  dir= 89%  n=44 ← peak
+
+  2B (120 events):  predicted=+0.0163
+    Peak: +0.0224 at 75-100%
+       0-10%: -0.0018  (  8.1%)  dir= 48%  n=33
+      10-25%: +0.0100  ( 44.6%)  dir= 60%  n=58
+      25-50%: -0.0022  ( 10.0%)  dir= 55%  n=85
+      50-75%: +0.0153  ( 68.3%)  dir= 63%  n=96
+     75-100%: +0.0224  (100.0%)  dir= 78%  n=103 ← peak
+
+  1B (350 events):  predicted=+0.0242
+    Peak: +0.0193 at 75-100%
+       0-10%: +0.0079  ( 40.9%)  dir= 43%  n=91
+      10-25%: +0.0019  ( 10.1%)  dir= 46%  n=154
+      25-50%: +0.0049  ( 25.2%)  dir= 52%  n=230
+      50-75%: +0.0125  ( 64.7%)  dir= 59%  n=276
+     75-100%: +0.0193  (100.0%)  dir= 67%  n=297 ← peak
+
+  BB (276 events):  predicted=+0.0149
+    Peak: +0.0032 at 75-100%
+       0-10%: -0.0156  (492.2%)  dir= 39%  n=84
+      10-25%: -0.0060  (189.8%)  dir= 42%  n=143
+      25-50%: -0.0031  ( 97.6%)  dir= 51%  n=194
+      50-75%: -0.0055  (172.7%)  dir= 54%  n=223
+     75-100%: +0.0032  (100.0%)  dir= 60%  n=243 ← peak
+
+  DP (56 events):  predicted=-0.0092
+    Peak: -0.0325 at 75-100%
+       0-10%: +0.0115  ( 35.3%)  dir= 44%  n=27
+      10-25%: +0.0063  ( 19.5%)  dir= 46%  n=41
+      25-50%: -0.0189  ( 58.0%)  dir= 56%  n=45
+      50-75%: -0.0258  ( 79.4%)  dir= 70%  n=48
+     75-100%: -0.0325  (100.0%)  dir= 78%  n=51 ← peak
+
+  OUT (1089 events):  predicted=-0.0052
+    Peak: -0.0102 at 75-100%
+       0-10%: -0.0046  ( 44.5%)  dir= 58%  n=290
+      10-25%: -0.0074  ( 72.7%)  dir= 57%  n=538
+      25-50%: -0.0074  ( 72.7%)  dir= 62%  n=722
+      50-75%: -0.0077  ( 75.2%)  dir= 63%  n=830
+     75-100%: -0.0102  (100.0%)  dir= 67%  n=883 ← peak
+
+  K (526 events):  predicted=-0.0027
+    Peak: -0.0105 at 0-10%
+       0-10%: -0.0105  (100.0%)  dir= 54%  n=189 ← peak
+      10-25%: -0.0008  (  8.0%)  dir= 55%  n=297
+      25-50%: -0.0048  ( 46.2%)  dir= 59%  n=399
+      50-75%: -0.0080  ( 76.2%)  dir= 64%  n=432
+     75-100%: -0.0090  ( 86.1%)  dir= 68%  n=451
+
+  Event Count  Predicted     Peak   Peak @  Best Dir    Dir @
+  ------------------------------------------------------------
+     HR    50    +0.0835  +0.0930  75-100%       89%  75-100%
+     2B   120    +0.0163  +0.0224  75-100%       78%  75-100%
+     1B   350    +0.0242  +0.0193  75-100%       67%  75-100%
+     BB   276    +0.0149  +0.0032  75-100%       60%  75-100%
+     DP    56    -0.0092  -0.0325  75-100%       78%  75-100%
+    OUT  1089    -0.0052  -0.0102  75-100%       67%  75-100%
+      K   526    -0.0027  -0.0105    0-10%       68%  75-100%
+
+======================================================================
+SPREAD — HIGH LEVERAGE (1811 plays, |delta| >= 0.01)
+
+  HR (47 events):  predicted=+0.0664
+    Peak: +0.0729 at 75-100%
+       0-10%: -0.0129  ( 17.6%)  dir= 36%  n=14
+      10-25%: +0.0000  (  0.0%)  dir= 57%  n=21
+      25-50%: +0.0200  ( 27.5%)  dir= 65%  n=34
+      50-75%: +0.0392  ( 53.8%)  dir= 79%  n=39
+     75-100%: +0.0729  (100.0%)  dir= 88%  n=42 ← peak
+
+  2B (107 events):  predicted=+0.0103
+    Peak: +0.0137 at 75-100%
+       0-10%: +0.0047  ( 34.0%)  dir= 47%  n=30
+      10-25%: +0.0136  ( 99.0%)  dir= 60%  n=50
+      25-50%: +0.0033  ( 23.9%)  dir= 57%  n=76
+      50-75%: +0.0069  ( 50.5%)  dir= 62%  n=85
+     75-100%: +0.0137  (100.0%)  dir= 78%  n=91 ← peak
+
+  1B (289 events):  predicted=+0.0193
+    Peak: +0.0192 at 75-100%
+       0-10%: +0.0077  ( 39.9%)  dir= 44%  n=81
+      10-25%: +0.0029  ( 15.1%)  dir= 48%  n=128
+      25-50%: +0.0081  ( 42.4%)  dir= 52%  n=187
+      50-75%: +0.0130  ( 67.7%)  dir= 58%  n=230
+     75-100%: +0.0192  (100.0%)  dir= 67%  n=247 ← peak
+
+  BB (219 events):  predicted=+0.0141
+    Peak: +0.0024 at 75-100%
+       0-10%: -0.0168  (696.1%)  dir= 38%  n=68
+      10-25%: -0.0066  (274.4%)  dir= 43%  n=115
+      25-50%: -0.0084  (347.4%)  dir= 53%  n=153
+      50-75%: -0.0051  (212.4%)  dir= 58%  n=174
+     75-100%: +0.0024  (100.0%)  dir= 63%  n=191 ← peak
+
+  DP (46 events):  predicted=-0.0122
+    Peak: -0.0419 at 75-100%
+       0-10%: +0.0045  ( 10.8%)  dir= 36%  n=22
+      10-25%: -0.0015  (  3.5%)  dir= 44%  n=34
+      25-50%: -0.0276  ( 65.8%)  dir= 59%  n=37
+      50-75%: -0.0377  ( 90.1%)  dir= 72%  n=40
+     75-100%: -0.0419  (100.0%)  dir= 83%  n=42 ← peak
+
+  OUT (740 events):  predicted=-0.0047
+    Peak: -0.0095 at 75-100%
+       0-10%: -0.0004  (  3.7%)  dir= 58%  n=200
+      10-25%: -0.0039  ( 41.1%)  dir= 54%  n=369
+      25-50%: -0.0052  ( 54.4%)  dir= 61%  n=499
+      50-75%: -0.0079  ( 83.2%)  dir= 61%  n=568
+     75-100%: -0.0095  (100.0%)  dir= 66%  n=603 ← peak
+
+  K (363 events):  predicted=-0.0019
+    Peak: -0.0076 at 0-10%
+       0-10%: -0.0076  (100.0%)  dir= 53%  n=132 ← peak
+      10-25%: -0.0014  ( 18.5%)  dir= 55%  n=207
+      25-50%: -0.0036  ( 47.1%)  dir= 58%  n=280
+      50-75%: -0.0051  ( 67.1%)  dir= 62%  n=295
+     75-100%: -0.0062  ( 81.8%)  dir= 65%  n=310
+
+  Event Count  Predicted     Peak   Peak @  Best Dir    Dir @
+  ------------------------------------------------------------
+     HR    47    +0.0664  +0.0729  75-100%       88%  75-100%
+     2B   107    +0.0103  +0.0137  75-100%       78%  75-100%
+     1B   289    +0.0193  +0.0192  75-100%       67%  75-100%
+     BB   219    +0.0141  +0.0024  75-100%       63%  75-100%
+     DP    46    -0.0122  -0.0419  75-100%       83%  75-100%
+    OUT   740    -0.0047  -0.0095  75-100%       66%  75-100%
+      K   363    -0.0019  -0.0076    0-10%       65%  75-100%
+
+==============================================================================
+SINGLE-MARKET vs MULTI-MARKET  (alpha=0.6, $500/play)
+==============================================================================
+
+                       Single Market    Multi Market      Difference
+----------------------------------------------------------------------
+Total trades                   2,157           3,974          +84.2%
+Fill rate                      72.6%           69.7%          -2.9pp
+Avg profit/fill              +0.0381         +0.0352         -0.0030
+Avg loss/miss                +0.0003         +0.0002         -0.0001
+EV per trade                 +0.0278         +0.0246         -0.0032
+Total P&L                   $+83,601        $+75,307           -9.9%
+Win rate                       82.3%           79.4%          -2.9pp
+Per game                     $+2,322         $+2,092           -9.9%
+Std dev / game                $1,015            $885           $-129
+Worst game                     $+957           $+892            $-65
+
+By market type (total P&L):
+  Market             Single        Multi   Difference
+  ----------------------------------------------------
+  Moneyline    $    +23,284 $    +20,398       -12.4%
+  O/U          $    +26,184 $    +24,220        -7.5%
+  Spread       $    +34,132 $    +30,688       -10.1%
+
+Per-event breakdown (trades / P&L):
+  Event  Single n   Single P&L  Multi n    Multi P&L
+  ------------------------------------------------------
+  HR           50 $    +12,283      120 $    +10,029
+  2B          126 $     +9,491      260 $     +8,793
+  1B          358 $    +19,363      731 $    +17,388
+  BB          267 $     +5,693      514 $     +5,365
+  DP           56 $     +2,700      123 $     +2,462
+  OUT         867 $    +22,700    1,488 $    +20,225
+  K           433 $    +11,372      738 $    +11,044
+
+Saved single-mode trades: /Users/ethan/Desktop/LiveLine/backend/backtests/reports/multi_market_single_trades_20260413_183750Z.csv
+Saved multi-mode trades:  /Users/ethan/Desktop/LiveLine/backend/backtests/reports/multi_market_multi_trades_20260413_183750Z.csv
+
+Done.
+
+Report saved: /Users/ethan/Desktop/LiveLine/backend/backtests/reports/backtest_20260413_182732Z.txt
