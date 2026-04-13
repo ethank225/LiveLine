@@ -103,7 +103,7 @@ def _cancel_order(order_id: str, *, dry_run: bool) -> dict:
     return kalshi.cancel_order(order_id)
 
 
-def _actual_fill(response: dict) -> tuple[float, int] | None:
+def _actual_fill(response: dict, action: str = "buy") -> tuple[float, int] | None:
     """Return `(per_contract_price, filled_qty)` from a Kalshi order
     response, or `None` if the order did not fill.
 
@@ -113,6 +113,10 @@ def _actual_fill(response: dict) -> tuple[float, int] | None:
     Dividing recovers the per-contract VWAP. Using the limit price
     instead would over-report losses on a winning IOC exit by ~40-60¢
     per contract.
+
+    For sells, `taker_fill_cost_dollars` reports the complementary-side
+    cost (e.g. NO cost when selling YES), not the revenue. Invert via
+    `1.00 - per_contract` so the caller gets the price actually received.
 
     Logs every field we read so a schema-drift bug (e.g. Kalshi moving
     to per-contract cost) is visible in prod without new instrumentation.
@@ -144,7 +148,7 @@ def _actual_fill(response: dict) -> tuple[float, int] | None:
 
     per_contract = round(cost / qty, 4)
     logger.info(
-        f"[kalshi] _actual_fill order_id={order_id} "
+        f"[kalshi] _actual_fill order_id={order_id} action={action} "
         f"fill_count_fp={qty_raw!r} "
         f"taker_fill_cost_dollars={cost_raw_taker!r} "
         f"maker_fill_cost_dollars={cost_raw_maker!r} "
@@ -160,7 +164,14 @@ def _actual_fill(response: dict) -> tuple[float, int] | None:
             f"[0.01, 0.99] — assuming taker_fill_cost_dollars is already "
             f"per-contract. Using ${cost:.4f} as fill price."
         )
-        return (round(cost, 4), qty)
+        raw = round(cost, 4)
+        if action == "sell":
+            raw = round(1.00 - raw, 4)
+        return (raw, qty)
+    if action == "sell":
+        # taker_fill_cost_dollars on a sell is the complementary-side
+        # cost; revenue per contract = 1 - that.
+        per_contract = round(1.00 - per_contract, 4)
     return (per_contract, qty)
 
 
@@ -938,7 +949,7 @@ class Trade:
             )
             return exit_price
 
-        fill = _actual_fill(response)
+        fill = _actual_fill(response, action="sell")
         if fill is None:
             # IOC returned no fills — no bids at ≥$0.01 (very rare). Use
             # the fallback / current bid so P&L still reflects something.
