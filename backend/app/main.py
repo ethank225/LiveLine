@@ -920,9 +920,16 @@ async def update_settings_endpoint(
     user AND persisted to Supabase. The two writes together keep per-game
     state consistent and survive across restarts."""
     kwargs = body.model_dump(exclude_unset=True, exclude_none=True)
-    # Fan out to all of this user's active sessions. If none exist yet, the
-    # helper returns DEFAULT_SETTINGS merged with the clamped input.
-    current = trader.update_user_settings_all_sessions(user.id, **kwargs)
+    # Load the user's persisted prefs first. When they're updating from
+    # the Settings page without any game open (no active sessions), this
+    # is what stops every other setting from snapping back to defaults.
+    # With an active session, session.settings was already seeded from
+    # the DB at session creation, so this read is only load-bearing in
+    # the no-session branch of the helper below.
+    saved = await asyncio.to_thread(db.get_user_settings, user.id)
+    current = trader.update_user_settings_all_sessions(
+        user.id, saved_prefs=saved or {}, **kwargs,
+    )
 
     # Persist only whitelisted keys. Fire-and-forget on a thread so the
     # response doesn't block on a Supabase round-trip.

@@ -1307,19 +1307,37 @@ def update_session_settings(user_id: str, game_id: int, **kwargs) -> dict | None
         return dict(session.settings)
 
 
-def update_user_settings_all_sessions(user_id: str, **kwargs) -> dict:
+def update_user_settings_all_sessions(
+    user_id: str, *, saved_prefs: dict | None = None, **kwargs,
+) -> dict:
     """Apply a partial settings update to every open session for this user.
     Used by PUT /settings — changing a toggle in the UI fans out to all
     of the user's active games. Returns the resulting settings (from the
-    last session touched, or the clamped input if no sessions exist yet)."""
+    last session touched, or defaults+saved_prefs+clean when no sessions
+    exist yet).
+
+    `saved_prefs` is the user's persisted preferences from Supabase. It
+    MUST be passed when there are no active sessions — otherwise the
+    no-session branch returns a fresh copy of DEFAULT_SETTINGS with only
+    the one changed field overlaid, resetting every other preference
+    the user had saved. The endpoint does the DB read (via
+    asyncio.to_thread) and hands the result in so this function stays
+    sync and I/O-free."""
     from app.market_selector import DEFAULT_SETTINGS, clamp_settings
     clean = clamp_settings({k: v for k, v in kwargs.items() if k in _SETTINGS_WHITELIST})
     with _registry_lock:
         mine = [s for s in _sessions.values() if s.user_id == user_id]
     if not mine:
-        # No session yet — caller will still persist to DB; return the
-        # defaults + clean merge so the response reflects the saved values.
-        return {**DEFAULT_SETTINGS, **clean}
+        # Base = defaults, overlaid with the user's persisted prefs, then
+        # the clamped new change. Without saved_prefs, any key the user
+        # had toggled away from its default would snap back on every
+        # subsequent change — e.g. use_undo_window=False quietly
+        # reverting to True when the user toggles dry_run.
+        saved_clean = clamp_settings({
+            k: v for k, v in (saved_prefs or {}).items()
+            if k in _SETTINGS_WHITELIST
+        })
+        return {**DEFAULT_SETTINGS, **saved_clean, **clean}
     latest = None
     for s in mine:
         with s._lock:
