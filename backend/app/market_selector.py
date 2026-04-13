@@ -19,7 +19,11 @@ import asyncio
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import date
+# Ticker prefix must use the same "MLB day" that game_state.py used to
+# fetch the schedule, otherwise a 7 PM PT game on UTC hosts gets a
+# next-day prefix and never matches any Kalshi event. Single source of
+# truth: game_state.mlb_today().
+from app.game_state import mlb_today
 
 from app.constants import (
     ALL_OU_LINES, ALL_SPREAD_LINES,
@@ -180,41 +184,80 @@ def _search_event_ticker(home_abbr: str, away_abbr: str) -> str | None:
     Real format: KXMLBGAME-{YY}{MON}{DD}{HHMM}{AWAY}{HOME}
     """
     if not kalshi.is_connected:
+        logger.warning("_search_event_ticker: Kalshi not connected — aborting")
         return None
 
-    today = date.today()
+    today = mlb_today()
     date_prefix = today.strftime("%y%b%d").upper()
+    home_u = home_abbr.upper()
+    away_u = away_abbr.upper()
 
+    logger.info(
+        f"_search_event_ticker: searching KXMLBGAME for "
+        f"home={home_u} away={away_u} date_prefix={date_prefix} "
+        f"(pacific date={today.isoformat()})"
+    )
+
+    # --- Strategy 1: list KXMLBGAME events + filter -----------------------
     try:
-        events = kalshi.client.get_events(series_ticker="KXMLBGAME", limit=50)
-        for ev in events:
-            ticker = getattr(ev, "event_ticker", "")
-            if date_prefix not in ticker:
-                continue
-            ticker_upper = ticker.upper()
-            if away_abbr.upper() in ticker_upper and home_abbr.upper() in ticker_upper:
-                logger.info(f"Found event ticker: {ticker}")
-                return ticker
+        # fetch_all=True so we don't miss late-day games if Kalshi returns
+        # multi-day results that push today's slate past the page cap.
+        events = list(kalshi.client.get_events(
+            series_ticker="KXMLBGAME",
+            fetch_all=True,
+        ))
     except Exception as e:
-        logger.debug(f"Series search failed: {e}")
+        logger.error(f"_search_event_ticker: get_events failed: {e}")
+        events = []
 
-    # Strategy 2: brute-force common time slots
+    all_tickers = [getattr(ev, "event_ticker", "") for ev in events]
+    logger.info(
+        f"_search_event_ticker: Kalshi returned {len(events)} events for KXMLBGAME; "
+        f"sample: {all_tickers[:10]}"
+    )
+
+    # How many events match just the date (useful to distinguish a TZ bug
+    # from a teams-not-matched bug).
+    date_matches = [t for t in all_tickers if date_prefix in t]
+    logger.info(
+        f"_search_event_ticker: {len(date_matches)} events match date_prefix={date_prefix}; "
+        f"sample: {date_matches[:10]}"
+    )
+
+    for ticker in all_tickers:
+        if date_prefix not in ticker:
+            continue
+        tu = ticker.upper()
+        if away_u in tu and home_u in tu:
+            logger.info(f"_search_event_ticker: matched {ticker} (strategy=list)")
+            return ticker
+
+    logger.warning(
+        f"_search_event_ticker: no list-match for home={home_u} away={away_u} "
+        f"date_prefix={date_prefix}; falling back to brute-force time scan"
+    )
+
+    # --- Strategy 2: brute-force common start-time slots ------------------
     candidates = []
     for hh in range(12, 24):
         for mm in ["00", "05", "10", "15", "20", "30", "35", "40", "45"]:
             candidates.append(
-                f"KXMLBGAME-{date_prefix}{hh:02d}{mm}{away_abbr}{home_abbr}"
+                f"KXMLBGAME-{date_prefix}{hh:02d}{mm}{away_u}{home_u}"
             )
 
     for ticker in candidates:
         try:
             markets = kalshi.get_markets(ticker)
             if markets:
-                logger.info(f"Found event ticker: {ticker}")
+                logger.info(f"_search_event_ticker: matched {ticker} (strategy=brute)")
                 return ticker
         except Exception:
             continue
 
+    logger.warning(
+        f"_search_event_ticker: no match found after brute-force "
+        f"(home={home_u} away={away_u} date_prefix={date_prefix})"
+    )
     return None
 
 

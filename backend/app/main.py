@@ -8,7 +8,6 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import date
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +17,7 @@ from pydantic import BaseModel
 from app import database as db
 from app.auth import CurrentUser, get_current_user
 from app.engine import GameState, compute_deltas, get_win_expectancy, ALL_OU_LINES, ALL_SPREAD_LINES
-from app.game_state import get_game_state, get_todays_games
+from app.game_state import get_game_state, get_todays_games, mlb_today
 from app.kalshi_client import kalshi
 from app.market_selector import (
     DEFAULT_SETTINGS,
@@ -180,7 +179,10 @@ async def auth_logout(user: CurrentUser = Depends(get_current_user)):
 async def list_games(user: CurrentUser = Depends(get_current_user)):
     """List today's MLB games with IDs, teams, scores, and status."""
     games = await asyncio.to_thread(get_todays_games)
-    return {"date": date.today().isoformat(), "games": games}
+    # Label the response with the Pacific MLB day — must match the date
+    # the schedule was actually queried for, otherwise the frontend and
+    # the data disagree across the ~5 PM PT / midnight UTC boundary.
+    return {"date": mlb_today().isoformat(), "games": games}
 
 
 _last_game_state_cache: dict[int, dict] = {}
