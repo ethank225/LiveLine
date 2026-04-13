@@ -13,14 +13,23 @@ function formatTime(startTime) {
   return new Date(startTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
 }
 
-export default function GameCard({ game, highlighted }) {
+export default function GameCard({ game, highlighted, onPreGameTap }) {
   const navigate = useNavigate()
   const isLive = game.status === 'In Progress'
   const isFinal = game.status === 'Final'
   const isPreGame = !isLive && !isFinal
 
   const handleTap = () => {
-    if (isFinal) return
+    // Pre-game: don't navigate to the trading screen — there's no live
+    // feed yet. Hand off to the parent so it can show a toast telling
+    // the user when the game starts.
+    if (isPreGame) {
+      if (navigator.vibrate) navigator.vibrate(10)
+      onPreGameTap?.(game)
+      return
+    }
+    // Live and Final both navigate — Final lands on the trade-history
+    // view which reads Supabase without needing the live feed.
     if (navigator.vibrate) navigator.vibrate(10)
     navigate(`/game/${game.game_id}`)
   }
@@ -29,10 +38,9 @@ export default function GameCard({ game, highlighted }) {
     <div
       onClick={handleTap}
       className={`
-        rounded-xl p-4 mb-3 transition-all
-        ${isFinal ? 'bg-slate-800/40 opacity-50' : 'bg-slate-800 active:scale-[0.98]'}
+        rounded-xl p-4 mb-3 transition-all cursor-pointer
+        ${isFinal ? 'bg-slate-800/40 opacity-60' : 'bg-slate-800 active:scale-[0.98]'}
         ${highlighted ? 'ring-2 ring-blue-500' : ''}
-        ${isFinal ? '' : 'cursor-pointer'}
       `}
     >
       <div className="flex items-center justify-between">

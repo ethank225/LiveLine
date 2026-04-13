@@ -27,3 +27,18 @@
     animation: none;
   }
 }
+
+/* Generic fade-in for transient UI (toasts, popovers). Starts slightly
+   offset so it doesn't just pop; ~200ms so it reads as immediate. */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translate(-50%, 4px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
+}
+.animate-fade-in {
+  animation: fadeIn 200ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in {
+    animation: none;
+  }
+}

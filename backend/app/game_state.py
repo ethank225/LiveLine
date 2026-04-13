@@ -5,11 +5,19 @@ Retrieves today's schedule and parses live game feeds into clean GameState objec
 """
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import statsapi
 
 from app.engine import GameState
+
+# MLB's business day boundary is roughly US Pacific — the latest West
+# Coast games start around 7 PM PT. Running on UTC (Railway, most cloud
+# hosts) otherwise drops those games from "today" as soon as midnight
+# UTC crosses ~5 PM PT. Using zoneinfo (Python 3.9+) avoids the pytz
+# dependency.
+_MLB_TZ = ZoneInfo("US/Pacific")
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -35,8 +43,12 @@ class GameInfo:
 def get_todays_games() -> list[dict]:
     """
     Fetch today's MLB schedule. Returns a list of game summary dicts.
+
+    "Today" is evaluated in US Pacific time, not the server's local
+    timezone — a 7 PM PT game (2 AM UTC the next day) would otherwise
+    drop off the schedule on UTC hosts like Railway.
     """
-    today = date.today().strftime("%m/%d/%Y")
+    today = datetime.now(_MLB_TZ).strftime("%m/%d/%Y")
     games = statsapi.schedule(date=today)
 
     return [

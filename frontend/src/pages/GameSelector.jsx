@@ -11,7 +11,24 @@ export default function GameSelector() {
   const [error, setError] = useState(null)
   const [offline, setOffline] = useState(false)
   const [loaded, setLoaded] = useState(false)
+  const [toast, setToast] = useState(null)
   const cachedGames = useRef([])
+  const toastTimer = useRef(null)
+
+  // Shown when the user taps a game that hasn't started yet. Auto-hides
+  // after 3s; subsequent taps reset the timer rather than stacking.
+  const handlePreGameTap = useCallback((game) => {
+    const when = game.start_time
+      ? new Date(game.start_time).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+      : null
+    setToast(when ? `Game starts at ${when}. Come back then!` : 'Game hasn\u2019t started yet.')
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToast(null), 3000)
+  }, [])
+
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+  }, [])
 
   const fetchGames = useCallback(async () => {
     try {
@@ -106,7 +123,7 @@ export default function GameSelector() {
         {live.length > 0 && (
           <Section title="Live now" count={live.length}>
             {live.map(g => (
-              <GameCard key={g.game_id} game={g} highlighted={query && true} />
+              <GameCard key={g.game_id} game={g} highlighted={query && true} onPreGameTap={handlePreGameTap} />
             ))}
           </Section>
         )}
@@ -115,7 +132,7 @@ export default function GameSelector() {
         {upcoming.length > 0 && (
           <Section title="Starting soon" count={upcoming.length}>
             {upcoming.map(g => (
-              <GameCard key={g.game_id} game={g} highlighted={query && true} />
+              <GameCard key={g.game_id} game={g} highlighted={query && true} onPreGameTap={handlePreGameTap} />
             ))}
           </Section>
         )}
@@ -124,7 +141,7 @@ export default function GameSelector() {
         {final.length > 0 && (
           <Section title="Final" count={final.length}>
             {final.map(g => (
-              <GameCard key={g.game_id} game={g} highlighted={false} />
+              <GameCard key={g.game_id} game={g} highlighted={false} onPreGameTap={handlePreGameTap} />
             ))}
           </Section>
         )}
@@ -139,6 +156,20 @@ export default function GameSelector() {
         )}
       </div>
       </>
+      )}
+
+      {/* Toast — fixed above the tab bar, auto-dismisses. One slot,
+          no stacking: a second tap resets the same message. */}
+      {toast && (
+        <div
+          className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50
+                     bg-slate-700 text-white text-sm px-6 py-3 rounded-full
+                     shadow-lg pointer-events-none animate-fade-in"
+          role="status"
+          aria-live="polite"
+        >
+          {toast}
+        </div>
       )}
     </div>
   )
