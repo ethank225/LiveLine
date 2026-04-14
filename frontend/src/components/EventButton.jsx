@@ -46,7 +46,7 @@ function EventButton({ event, trade, disabled, onBuy, multiMarket = false }) {
     prevProfit.current = estimatedProfit
     if (Math.abs(profit - prev) > 1) {
       setFlash(true)
-      const t = setTimeout(() => setFlash(false), 600)
+      const t = setTimeout(() => setFlash(false), 50)
       return () => clearTimeout(t)
     }
   }, [estimatedProfit, profit])
@@ -79,7 +79,7 @@ function EventButton({ event, trade, disabled, onBuy, multiMarket = false }) {
     }
   }
 
-  const baseClasses = 'rounded-xl border w-full min-h-[88px] flex items-center justify-center transition-all duration-150 ease-out'
+  const baseClasses = 'rounded-xl border w-full min-h-[88px] flex items-center justify-center'
   const stackClasses = 'flex flex-col items-center justify-center gap-[4px] px-2 py-3'
 
   if (inactive) {
@@ -103,10 +103,8 @@ function EventButton({ event, trade, disabled, onBuy, multiMarket = false }) {
       className={`
         ${baseClasses} cursor-pointer
         ${accentStyles[accent]}
-        hover:-translate-y-0.5 hover:shadow-lg
-        active:scale-95 active:translate-y-0
-        disabled:opacity-40 disabled:pointer-events-none disabled:hover:translate-y-0 disabled:hover:shadow-none
-        ${flash ? 'brightness-125 scale-[1.03]' : ''}
+        disabled:opacity-40 disabled:pointer-events-none
+        ${flash ? '!bg-emerald-300/60 !border-emerald-200' : ''}
       `}
     >
       {loading ? (

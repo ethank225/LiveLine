@@ -282,6 +282,11 @@ def log_trade(
             "user_timestamp": _ts_from_ms(user_timestamp_ms),
             "dry_run": bool(dry_run),
             "undo_group_id": undo_group_id,
+            "entry_fee_est": trade_info.get("entry_fee_est"),
+            "exit_fee_est": trade_info.get("exit_fee_est"),
+            "net_expected_profit": trade_info.get("net_expected_profit"),
+            "fee_adjusted": trade_info.get("fee_adjusted"),
+            "gross_pick_ticker": trade_info.get("gross_pick_ticker"),
         }
         inserted = client.table("trades").insert(row).execute()
         if inserted.data:

@@ -33,6 +33,7 @@ from app.constants import (
 from app import database as db
 from app.bet_label import compute_display_label
 from app.engine import EventDelta
+from app.fees import taker_fee, maker_fee
 from app.kalshi_client import kalshi
 from app.line_selection import pick_ou_line, pick_spread_line
 
@@ -565,11 +566,22 @@ def _evaluate_market(
             f"move={move_cents}¢ < {min_move_cents}¢"
         )
         return None
+    # Fee-aware net expected profit. Entry is Taker (we hit the book); exit is
+    # Maker (our sell target is a resting limit). `bet_size` is contracts, not
+    # dollars — see constants.DEFAULT_BET_SIZE.
+    entry_fee = taker_fee(contracts=bet_size, price_dollars=best["entry_price"])
+    exit_fee = maker_fee(contracts=bet_size, price_dollars=best["sell_target"])
+    net_expected_profit = (
+        (best["sell_target"] - best["entry_price"]) * bet_size - entry_fee - exit_fee
+    )
+
     picked_label = yes_label if best["side"] == "YES" else no_label
     logger.info(
         f"{prefix} → trade {picked_label} ({best['side']}) "
         f"entry={best['entry_price']} target={best['sell_target']} "
-        f"ev={best['ev_per_contract']:+.4f}"
+        f"ev={best['ev_per_contract']:+.4f} "
+        f"net_ev={net_expected_profit:+.4f} "
+        f"fees={entry_fee:.3f}+{exit_fee:.3f}"
     )
 
     return {
@@ -585,6 +597,9 @@ def _evaluate_market(
         "quantity": bet_size,
         "estimated_cost": round(best["entry_price"] * bet_size, 2),
         "estimated_profit": round(best["profit_per"] * bet_size, 2),
+        "entry_fee_est": round(entry_fee, 4),
+        "exit_fee_est": round(exit_fee, 4),
+        "net_expected_profit": round(net_expected_profit, 4),
     }
 
 
@@ -729,11 +744,29 @@ def compute_best_trades(
                     candidates.append(trade)
 
         if candidates:
-            # Best for the single-market path (sort desc by EV).
-            candidates.sort(key=lambda t: t["ev_per_contract"], reverse=True)
-            best_trade = dict(candidates[0])
+            # Two sorts: the old gross-EV rule and the new net-EV rule. We pick
+            # by net EV but remember the gross pick so we can flag trades where
+            # fee-awareness changed the choice.
+            gross_sorted = sorted(
+                candidates, key=lambda t: t["ev_per_contract"], reverse=True
+            )
+            net_sorted = sorted(
+                candidates, key=lambda t: t["net_expected_profit"], reverse=True
+            )
+            gross_pick = gross_sorted[0]
+            net_pick = net_sorted[0]
+            fee_adjusted = (
+                gross_pick["market_ticker"] != net_pick["market_ticker"]
+                or gross_pick["side"] != net_pick["side"]
+            )
+
+            best_trade = dict(net_pick)
             best_trade["event"] = d.event
-            best_trade["active"] = best_trade["ev_per_contract"] > 0
+            best_trade["active"] = best_trade["net_expected_profit"] > 0
+            best_trade["fee_adjusted"] = fee_adjusted
+            best_trade["gross_pick_ticker"] = (
+                gross_pick["market_ticker"] if fee_adjusted else None
+            )
             best_trade["home_abbr"] = home_abbr
             best_trade["away_abbr"] = away_abbr
             best_trade["display_label"] = compute_display_label(
@@ -743,7 +776,16 @@ def compute_best_trades(
                 home_abbr=home_abbr,
                 away_abbr=away_abbr,
             )
-            # all_trades is the full positive-EV basket. Frontend ignores
+            if fee_adjusted:
+                logger.info(
+                    f"compute_best_trades game={game_id} event={d.event} "
+                    f"fee_adjusted=True: net_pick={net_pick['market_ticker']}/{net_pick['side']} "
+                    f"(net_ev={net_pick['net_expected_profit']:+.4f}) "
+                    f"was gross_pick={gross_pick['market_ticker']}/{gross_pick['side']} "
+                    f"(ev={gross_pick['ev_per_contract']:+.4f}, "
+                    f"net_ev={gross_pick['net_expected_profit']:+.4f})"
+                )
+            # all_trades is the full positive-net-EV basket. Frontend ignores
             # it in single-market mode; backend reads it in multi mode.
             best_trade["all_trades"] = [
                 {
@@ -760,7 +802,7 @@ def compute_best_trades(
                     ),
                 }
                 for c in candidates
-                if c["ev_per_contract"] > 0
+                if c["net_expected_profit"] > 0
             ]
             result[d.event] = best_trade
 
