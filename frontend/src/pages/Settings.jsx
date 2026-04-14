@@ -10,6 +10,7 @@ const AUTO_SAVE_KEYS = [
   'max_dollars',
   'alpha',
   'max_slippage_cents',
+  'min_move_cents',
   'dry_run',
   'multi_market',
   'use_undo_window',
@@ -111,6 +112,18 @@ export default function Settings() {
                   value={settings.max_slippage_cents}
                   onChange={v => update('max_slippage_cents', v)}
                   min={0} max={10} step={1}
+                  format={v => `${v}¢`}
+                />
+              }
+            />
+            <Row
+              label="Min move"
+              desc="Skip trades below this profit to clear fees"
+              control={
+                <Stepper
+                  value={settings.min_move_cents}
+                  onChange={v => update('min_move_cents', v)}
+                  min={0} max={20} step={1}
                   format={v => `${v}¢`}
                 />
               }

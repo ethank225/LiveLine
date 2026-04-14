@@ -71,6 +71,10 @@ DEFAULT_SETTINGS: dict = {
     # Multi-market: one tap fires every positive-EV market for the event.
     # Budget is split proportionally to EV across the basket.
     "multi_market": False,
+    # Minimum expected entry→target move (cents) for a trade to clear
+    # Kalshi round-trip fees. Filters at the eval layer so sub-threshold
+    # trades never reach the button grid.
+    "min_move_cents": 4,
 }
 
 
@@ -97,6 +101,8 @@ def clamp_settings(update: dict) -> dict:
         out["dry_run"] = bool(update["dry_run"])
     if "blowout_filter" in update and update["blowout_filter"] is not None:
         out["blowout_filter"] = bool(update["blowout_filter"])
+    if "min_move_cents" in update and update["min_move_cents"] is not None:
+        out["min_move_cents"] = max(0, int(update["min_move_cents"]))
     if "multi_market" in update and update["multi_market"] is not None:
         out["multi_market"] = bool(update["multi_market"])
     return out
@@ -442,6 +448,7 @@ def _evaluate_market(
     event: str | None = None,
     home_abbr: str = "",
     away_abbr: str = "",
+    min_move_cents: int = 0,
 ) -> dict | None:
     """Evaluate a single market for one event. Returns trade info or None."""
     prices = kalshi.get_prices(market.ticker)
@@ -548,6 +555,16 @@ def _evaluate_market(
     if best is None:
         logger.info(f"{prefix} → no trade")
         return None
+    # Round-trip fees eat profit on sub-threshold moves. Filter here so
+    # the trade never reaches the button grid.
+    move_cents = round(abs(best["sell_target"] - best["entry_price"]) * 100)
+    if min_move_cents > 0 and move_cents < min_move_cents:
+        picked_label = yes_label if best["side"] == "YES" else no_label
+        logger.info(
+            f"{prefix} → below min_move {picked_label} ({best['side']}) "
+            f"move={move_cents}¢ < {min_move_cents}¢"
+        )
+        return None
     picked_label = yes_label if best["side"] == "YES" else no_label
     logger.info(
         f"{prefix} → trade {picked_label} ({best['side']}) "
@@ -601,6 +618,7 @@ def compute_best_trades(
     alpha = settings.get("alpha", DEFAULT_SETTINGS["alpha"])
     bet_size = settings.get("bet_size", DEFAULT_SETTINGS["bet_size"])
     blowout_filter = settings.get("blowout_filter", DEFAULT_SETTINGS["blowout_filter"])
+    min_move_cents = int(settings.get("min_move_cents", DEFAULT_SETTINGS["min_move_cents"]))
 
     with _market_lock:
         markets = list(_game_markets.get(game_id, []))
@@ -690,7 +708,7 @@ def compute_best_trades(
         # --- Moneyline candidates ---
         if not (blowout_filter and is_blowout):
             for ml in ml_markets:
-                trade = _evaluate_market(ml, d.delta, alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr)
+                trade = _evaluate_market(ml, d.delta, alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents)
                 if trade:
                     candidates.append(trade)
 
@@ -698,7 +716,7 @@ def compute_best_trades(
         if ou_market:
             ou_delta_data = d.over_under.get(str(ou_market.line))
             if ou_delta_data:
-                trade = _evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr)
+                trade = _evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents)
                 if trade:
                     candidates.append(trade)
 
@@ -706,7 +724,7 @@ def compute_best_trades(
         for sp_market in sp_markets_picked:
             sp_delta_data = d.spread.get(str(sp_market.line))
             if sp_delta_data:
-                trade = _evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr)
+                trade = _evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents)
                 if trade:
                     candidates.append(trade)
 

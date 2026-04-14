@@ -1328,7 +1328,7 @@ def get_or_create_session(
 _SETTINGS_WHITELIST = frozenset({
     "alpha", "bet_size", "max_dollars", "max_slippage_cents",
     "use_undo_window", "use_stop_loss", "stop_loss_cents",
-    "dry_run", "blowout_filter", "multi_market",
+    "dry_run", "blowout_filter", "multi_market", "min_move_cents",
 })
 
 

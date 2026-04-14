@@ -884,6 +884,7 @@ class SettingsUpdate(BaseModel):
     bet_size: int | None = None
     max_dollars: float | None = None
     max_slippage_cents: int | None = None
+    min_move_cents: int | None = None
     use_undo_window: bool | None = None
     use_stop_loss: bool | None = None
     stop_loss_cents: int | None = None
@@ -898,7 +899,7 @@ class SettingsUpdate(BaseModel):
 USER_SETTINGS_KEYS = {
     "alpha", "bet_size", "max_dollars", "max_slippage_cents",
     "use_undo_window", "use_stop_loss", "stop_loss_cents",
-    "dry_run", "blowout_filter", "multi_market",
+    "dry_run", "blowout_filter", "multi_market", "min_move_cents",
 }
 
 
