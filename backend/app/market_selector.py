@@ -76,6 +76,17 @@ DEFAULT_SETTINGS: dict = {
     # Kalshi round-trip fees. Filters at the eval layer so sub-threshold
     # trades never reach the button grid.
     "min_move_cents": 4,
+    # Skip a market if no websocket tick has arrived in this many seconds.
+    # Cheap first filter — answers "is this market alive at all?" — paired
+    # with the exit-liquidity check below which answers "can I get out?".
+    # 0 disables the gate.
+    "stale_market_seconds": 60,
+    # Worst-case IOC-exit slippage tolerance (cents). Before placing a buy,
+    # require enough bid depth on the traded side to absorb the full position
+    # at no worse than (entry - this_many_cents). Catches markets that have
+    # quotes flickering but no real depth — guarantees we can exit without
+    # blowing past the stop-loss distance. 0 disables the gate.
+    "exit_slippage_cents": 5,
 }
 
 
@@ -106,6 +117,10 @@ def clamp_settings(update: dict) -> dict:
         out["min_move_cents"] = max(0, int(update["min_move_cents"]))
     if "multi_market" in update and update["multi_market"] is not None:
         out["multi_market"] = bool(update["multi_market"])
+    if "stale_market_seconds" in update and update["stale_market_seconds"] is not None:
+        out["stale_market_seconds"] = max(0, int(update["stale_market_seconds"]))
+    if "exit_slippage_cents" in update and update["exit_slippage_cents"] is not None:
+        out["exit_slippage_cents"] = max(0, int(update["exit_slippage_cents"]))
     return out
 
 
@@ -450,8 +465,23 @@ def _evaluate_market(
     home_abbr: str = "",
     away_abbr: str = "",
     min_move_cents: int = 0,
+    stale_market_seconds: int = 0,
+    exit_slippage_cents: int = 0,
 ) -> dict | None:
     """Evaluate a single market for one event. Returns trade info or None."""
+    prefix = f"eval[{event or '-'}][{market.label}]"
+
+    # Stale-market guard: if the websocket hasn't seen a tick on this ticker
+    # in `stale_market_seconds`, skip. Catches dead-market trades that pay
+    # the entry taker fee and never fill on exit.
+    if stale_market_seconds > 0 and kalshi.is_market_stale(
+        market.ticker, max_age_seconds=stale_market_seconds,
+    ):
+        logger.info(
+            f"{prefix} skipped: stale ticker (no tick in {stale_market_seconds}s)"
+        )
+        return None
+
     prices = kalshi.get_prices(market.ticker)
 
     yes_ask = prices["yes_ask"]
@@ -472,7 +502,6 @@ def _evaluate_market(
         market_ticker=market.ticker, side="NO", market_type=market.market_type,
         home_abbr=home_abbr, away_abbr=away_abbr,
     )
-    prefix = f"eval[{event or '-'}][{market.label}]"
     logger.info(
         f"{prefix} delta_in={delta_value:+.4f} d_eff={d:+.4f} flip={market.flip} "
         f"yes_bid={yes_bid} yes_ask={yes_ask} no_bid={no_bid} no_ask={no_ask}"
@@ -566,6 +595,27 @@ def _evaluate_market(
             f"move={move_cents}¢ < {min_move_cents}¢"
         )
         return None
+    # Exit-liquidity guard. The stale-tick gate above answered "is this market
+    # alive?"; this answers the harder question "can I actually get OUT?". If
+    # the limit sell at target doesn't fill, we IOC into the bid book at
+    # clean-window expiry — require enough resting bids on the traded side to
+    # absorb `bet_size` within `exit_slippage_cents` of entry. Without this,
+    # markets with quotes flickering but no real depth still pass.
+    if exit_slippage_cents > 0 and not kalshi.has_exit_liquidity(
+        ticker=market.ticker,
+        side=best["side"],
+        entry_price=best["entry_price"],
+        quantity=bet_size,
+        max_slippage_dollars=exit_slippage_cents / 100,
+    ):
+        picked_label = yes_label if best["side"] == "YES" else no_label
+        logger.info(
+            f"{prefix} → no trade {picked_label} ({best['side']}): "
+            f"insufficient exit liquidity (need {bet_size} contracts of bids "
+            f"≥ ${best['entry_price'] - exit_slippage_cents/100:.2f})"
+        )
+        return None
+
     # Fee-aware net expected profit. Entry is Taker (we hit the book); exit is
     # Maker (our sell target is a resting limit). `bet_size` is contracts, not
     # dollars — see constants.DEFAULT_BET_SIZE.
@@ -634,6 +684,12 @@ def compute_best_trades(
     bet_size = settings.get("bet_size", DEFAULT_SETTINGS["bet_size"])
     blowout_filter = settings.get("blowout_filter", DEFAULT_SETTINGS["blowout_filter"])
     min_move_cents = int(settings.get("min_move_cents", DEFAULT_SETTINGS["min_move_cents"]))
+    stale_market_seconds = int(settings.get(
+        "stale_market_seconds", DEFAULT_SETTINGS["stale_market_seconds"],
+    ))
+    exit_slippage_cents = int(settings.get(
+        "exit_slippage_cents", DEFAULT_SETTINGS["exit_slippage_cents"],
+    ))
 
     with _market_lock:
         markets = list(_game_markets.get(game_id, []))
@@ -723,7 +779,7 @@ def compute_best_trades(
         # --- Moneyline candidates ---
         if not (blowout_filter and is_blowout):
             for ml in ml_markets:
-                trade = _evaluate_market(ml, d.delta, alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents)
+                trade = _evaluate_market(ml, d.delta, alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents)
                 if trade:
                     candidates.append(trade)
 
@@ -731,7 +787,7 @@ def compute_best_trades(
         if ou_market:
             ou_delta_data = d.over_under.get(str(ou_market.line))
             if ou_delta_data:
-                trade = _evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents)
+                trade = _evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents)
                 if trade:
                     candidates.append(trade)
 
@@ -739,7 +795,7 @@ def compute_best_trades(
         for sp_market in sp_markets_picked:
             sp_delta_data = d.spread.get(str(sp_market.line))
             if sp_delta_data:
-                trade = _evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents)
+                trade = _evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents)
                 if trade:
                     candidates.append(trade)
 

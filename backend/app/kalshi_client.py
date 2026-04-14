@@ -16,6 +16,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -108,6 +109,10 @@ class KalshiManager:
         self._lock = threading.Lock()
         self._tick_callbacks: list[Callable] = []
         self._fill_callbacks: list[Callable] = []
+        # Liveness clock per ticker — last time we heard ANY price update on
+        # this market. Used by `is_market_stale` to gate trades against dead
+        # markets (the no_market_data losing-game pattern from the backtest).
+        self._last_tick_ts: dict[str, float] = {}
         self._connected = False
 
     @property
@@ -238,6 +243,7 @@ class KalshiManager:
         })
         with self._lock:
             self._price_cache[ticker] = prices
+            self._last_tick_ts[ticker] = time.time()
 
         for cb in self._tick_callbacks:
             try:
@@ -288,6 +294,12 @@ class KalshiManager:
             return
         self.feed.subscribe("ticker", market_ticker=market_ticker)
         self._subscribed.add(market_ticker)
+        # Seed the liveness clock so `is_market_stale` doesn't block trades
+        # on a freshly-subscribed ticker before the first real tick lands.
+        # Real ticks overwrite this in _on_ticker; the seed just buys the
+        # market a full `stale_market_seconds` warm-up window.
+        with self._lock:
+            self._last_tick_ts[market_ticker] = time.time()
         logger.info(f"Subscribed to {market_ticker}")
 
     # ------------------------------------------------------------------
@@ -325,6 +337,75 @@ class KalshiManager:
             _fill_complementary_side(row)
             result.append(row)
         return result
+
+    def has_exit_liquidity(
+        self,
+        ticker: str,
+        side: str,
+        entry_price: float,
+        quantity: int,
+        max_slippage_dollars: float = 0.05,
+    ) -> bool:
+        """True iff there are enough resting bids on the trade's side to
+        absorb an IOC exit of `quantity` contracts within
+        `max_slippage_dollars` of the entry price.
+
+        The worst-case exit happens when the limit sell at target doesn't
+        fill and the trader IOCs into the bid book at clean-window expiry.
+        If we can't exit the full position within `max_slippage`, the trade
+        is structurally doomed — entry taker fee paid, then a fire-sale
+        below entry. Skip it before placing the buy.
+
+        Reads the local OrderbookManager (websocket-maintained, microseconds,
+        no API call). Bid prices in `book.yes` / `book.no` are already in
+        their respective side-units, so the comparison against `entry_price`
+        is direct (entry_price comes from vwap which is also in side units).
+
+        Returns True when the local book is unavailable — we don't want to
+        block trades just because the orderbook hasn't snapshotted yet.
+        Pair this with `is_market_stale` as the cheap first filter.
+        """
+        if quantity <= 0:
+            return True
+        with self._lock:
+            book = self._books.get(ticker)
+        if book is None:
+            return True  # no local depth; let the trade through
+        bids = book.yes if side == "YES" else book.no
+        if not bids:
+            return False
+        floor = entry_price - max_slippage_dollars
+        available = 0
+        for price_str, qty_str in bids.items():
+            try:
+                price = float(price_str)
+                qty = int(float(qty_str))
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0 or price < floor:
+                continue
+            available += qty
+            if available >= quantity:
+                return True
+        return False
+
+    def is_market_stale(self, ticker: str, max_age_seconds: float = 60) -> bool:
+        """True if no websocket tick has arrived for `ticker` in the last
+        `max_age_seconds`. Used by the picker to skip dead markets — the
+        backtest's losing-game audit (LAA@CIN −$484, PHI@SF −$196,
+        ATL@LAA −$104) found 24–50% of trades on those days landed on
+        markets with zero exit-window activity, paying entry taker fees
+        for nothing.
+
+        A ticker that's never been seen is treated as stale (we have no
+        evidence it's alive). This is conservative: a freshly-subscribed
+        market may briefly read stale, but the first tick clears it.
+        """
+        with self._lock:
+            last = self._last_tick_ts.get(ticker)
+        if last is None:
+            return True
+        return (time.time() - last) > max_age_seconds
 
     def get_prices(self, market_ticker: str) -> dict:
         """Get current prices from cache, falling back to REST API."""

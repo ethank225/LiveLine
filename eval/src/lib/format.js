@@ -3,12 +3,15 @@ export const fmtMoney = (n) => `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`;
 export const fmtCents = (n) => (n == null ? "—" : `${n.toFixed(1)}¢`);
 
 export const fmtTime = (d) =>
-  d.toLocaleString(undefined, {
+  d.toLocaleString("en-US", {
     month: "short",
     day: "numeric",
-    hour: "numeric",
+    hour: "2-digit",
     minute: "2-digit",
-  });
+    second: "2-digit",
+    hour12: false,
+    timeZone: "UTC",
+  }) + " UTC";
 
 export const fmtDuration = (ms) => {
   if (!Number.isFinite(ms) || ms < 0) return "—";

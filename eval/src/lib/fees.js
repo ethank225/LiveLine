@@ -17,12 +17,20 @@ function feeForFill(qty, priceCents, orderType) {
 
 // Recompute total fees for a play if every fill's qty were scaled by `scale`.
 // Rounding is applied per-fill, matching Kalshi's per-order-book behavior.
+// Falls back to linearly scaling the observed fees when fills aren't
+// available — less accurate (no per-fill rounding, no maker/taker distinction
+// in the formula) but non-zero.
 export function scaledFees(play, scale) {
+  const entry = play.entryFills || [];
+  const exit = play.exitFills || [];
+  if (entry.length === 0 && exit.length === 0) {
+    return (play.fees || 0) * scale;
+  }
   let total = 0;
-  for (const f of play.entryFills || []) {
+  for (const f of entry) {
     total += feeForFill(f.qty * scale, f.price, f.orderType);
   }
-  for (const f of play.exitFills || []) {
+  for (const f of exit) {
     total += feeForFill(f.qty * scale, f.price, f.orderType);
   }
   return total;

@@ -115,6 +115,28 @@ body {
   border-color: var(--accent);
 }
 
+.export-btn {
+  margin-left: auto;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.export-btn:hover:not(:disabled) {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+.export-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .search-wrap { position: relative; flex: 1; max-width: 360px; }
 .search-icon {
   position: absolute;

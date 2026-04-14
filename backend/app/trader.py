@@ -38,6 +38,7 @@ from app.constants import (
     UNDO_WINDOW_SECONDS,
 )
 from app.kalshi_client import kalshi
+from app.pnl import compute_net
 
 logger = logging.getLogger(__name__)
 
@@ -440,7 +441,14 @@ class Trade:
         self.stop_loss: float = 0.0
         self.quantity: int = 0
         self.requested_quantity: int = 0
+        # Gross = (exit - entry) * qty. Net = gross - entry_fee - exit_fee.
+        # `realized_pnl` is the net number (what Kalshi actually credits);
+        # `gross_pnl` and the two fee legs are kept alongside so the audit
+        # log and analytics can separate fee drag from alpha.
         self.realized_pnl: float = 0.0
+        self.gross_pnl: float = 0.0
+        self.entry_fee: float = 0.0
+        self.exit_fee: float = 0.0
         self.exit_price: float | None = None
         self.completed_at: datetime | None = None
         self.created_at: datetime = datetime.utcnow()
@@ -764,12 +772,15 @@ class Trade:
 
         exit_price = self._ioc_exit(reason="expired", dry_run=dry_run)
         with self._lock:
-            self.realized_pnl = round((exit_price - self.entry_price) * self.quantity, 2)
+            self._finalize_pnl(
+                exit_price=exit_price, qty=self.quantity, exit_role="taker",
+            )
             self.exit_price = exit_price
             self.completed_at = datetime.utcnow()
 
         logger.info(
-            f"{self._log_prefix} RESOLVED expired pnl={_fmt_pnl(self.realized_pnl)}"
+            f"{self._log_prefix} RESOLVED expired pnl={_fmt_pnl(self.realized_pnl)} "
+            f"(gross={_fmt_pnl(self.gross_pnl)} fees=${self.entry_fee + self.exit_fee:.2f})"
         )
         self._update_db_status("expired", exit_price, self.realized_pnl)
         self._notify_resolved()
@@ -799,12 +810,15 @@ class Trade:
             exit_price = self._ioc_exit(reason="canceled_by_user", dry_run=dry_run)
 
         with self._lock:
-            self.realized_pnl = round((exit_price - self.entry_price) * self.quantity, 2)
+            self._finalize_pnl(
+                exit_price=exit_price, qty=self.quantity, exit_role="taker",
+            )
             self.exit_price = exit_price
             self.completed_at = datetime.utcnow()
 
         logger.info(
-            f"{self._log_prefix} RESOLVED canceled_by_user pnl={_fmt_pnl(self.realized_pnl)}"
+            f"{self._log_prefix} RESOLVED canceled_by_user pnl={_fmt_pnl(self.realized_pnl)} "
+            f"(gross={_fmt_pnl(self.gross_pnl)} fees=${self.entry_fee + self.exit_fee:.2f})"
         )
         self._update_db_status("canceled_by_user", exit_price, self.realized_pnl)
         self._notify_resolved()
@@ -895,12 +909,15 @@ class Trade:
         actual_exit = self._ioc_exit(reason="stopped", dry_run=dry_run, fallback_price=exit_price)
 
         with self._lock:
-            self.realized_pnl = round((actual_exit - self.entry_price) * self.quantity, 2)
+            self._finalize_pnl(
+                exit_price=actual_exit, qty=self.quantity, exit_role="taker",
+            )
             self.exit_price = actual_exit
             self.completed_at = datetime.utcnow()
 
         logger.info(
-            f"{self._log_prefix} RESOLVED stopped pnl={_fmt_pnl(self.realized_pnl)}"
+            f"{self._log_prefix} RESOLVED stopped pnl={_fmt_pnl(self.realized_pnl)} "
+            f"(gross={_fmt_pnl(self.gross_pnl)} fees=${self.entry_fee + self.exit_fee:.2f})"
         )
         self._update_db_status("stopped", actual_exit, self.realized_pnl)
         self._notify_resolved()
@@ -1108,7 +1125,8 @@ class Trade:
                 # claimed the transition. No-op.
                 return
             self.status = "filled"
-            self.realized_pnl = round((exit_price - self.entry_price) * qty, 2)
+            # Limit sell at target → maker fee on the exit leg.
+            self._finalize_pnl(exit_price=exit_price, qty=qty, exit_role="maker")
             self.exit_price = exit_price
             self.completed_at = datetime.utcnow()
         # Lock released — safe to do side-effects that may take other locks.
@@ -1116,7 +1134,8 @@ class Trade:
             self._clean_timer.cancel()
         logger.info(
             f"{self._log_prefix} RESOLVED filled pnl={_fmt_pnl(self.realized_pnl)} "
-            f"(qty={qty} @${exit_price:.2f})"
+            f"(qty={qty} @${exit_price:.2f} gross={_fmt_pnl(self.gross_pnl)} "
+            f"fees=${self.entry_fee + self.exit_fee:.2f})"
         )
         self._update_db_status("filled", exit_price, self.realized_pnl)
         self._notify_resolved()
@@ -1239,6 +1258,25 @@ class Trade:
         except Exception as e:
             logger.error(f"_notify_resolved SSE push failed: {e}")
 
+    def _finalize_pnl(
+        self, *, exit_price: float, qty: int, exit_role: str,
+    ) -> None:
+        """Compute gross, fees, and net P&L for a closed trade and stash
+        them on `self`. Caller must hold self._lock.
+
+        Delegates the math to `app.pnl.compute_net` — same module the
+        backtest calls, so the two systems can't drift. `exit_role` is
+        "maker" when the resting limit sell executed at target, "taker"
+        when we crossed the book on an IOC (expire / undo / stop-loss).
+        Entry is always taker. Prices are in traded-side units (already
+        NO-flipped upstream for NO trades).
+        """
+        pnl = compute_net(self.entry_price, exit_price, qty, exit_role)
+        self.gross_pnl = pnl["gross"]
+        self.entry_fee = pnl["entry_fee"]
+        self.exit_fee = pnl["exit_fee"]
+        self.realized_pnl = pnl["net"]
+
     def _update_db_status(
         self,
         status: str,
@@ -1246,7 +1284,12 @@ class Trade:
         pnl: float | None = None,
     ):
         try:
-            db.update_trade_status(self.trade_db_id, status, exit_price, pnl)
+            db.update_trade_status(
+                self.trade_db_id, status, exit_price, pnl,
+                gross_pnl=self.gross_pnl if self.completed_at else None,
+                entry_fee=self.entry_fee if self.completed_at else None,
+                exit_fee=self.exit_fee if self.completed_at else None,
+            )
         except Exception as e:
             logger.error(f"Trade._update_db_status: {e}")
 

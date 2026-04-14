@@ -5,6 +5,7 @@ from datetime import datetime
 from backtests.mlb import PlayRecord, MarketSpec
 from backtests.constants import (
     EXIT_WINDOWS, ENTRY_OFFSET, CLEAN_BUFFER, WINDOW_SECONDS,
+    CLEAN_WINDOW_SECONDS,
     ALPHAS, STOP_LEVELS,
     HIGH_LEV_ML_THRESHOLD, HIGH_LEV_OU_PROXIMITY,
 )
@@ -16,6 +17,20 @@ from app.line_selection import pick_ou_line, pick_spread_line
 
 TRACE_MODE = False
 STOP_LOSS_ANALYSIS = False
+
+# Overrides ENTRY_OFFSET when set (via set_entry_offset). Value is in
+# seconds *before* the play timestamp, so positive = look-ahead (cheat),
+# negative = look-back / reaction delay (realistic). None → use default.
+_ENTRY_OFFSET_OVERRIDE: int | None = None
+
+
+def _entry_offset() -> int:
+    return ENTRY_OFFSET if _ENTRY_OFFSET_OVERRIDE is None else _ENTRY_OFFSET_OVERRIDE
+
+
+def set_entry_offset(seconds: int | None):
+    global _ENTRY_OFFSET_OVERRIDE
+    _ENTRY_OFFSET_OVERRIDE = seconds
 
 
 def set_stop_loss_analysis(enabled: bool):
@@ -267,6 +282,18 @@ def _pick_spread_spec(margin: int, spread_specs: list[MarketSpec]) -> MarketSpec
     return pick_spread_line(margin, spread_specs)
 
 
+def _pick_spread_specs_both_sides(
+    margin: int, spread_specs: list[MarketSpec]
+) -> list[MarketSpec]:
+    """Mirror of market_selector._pick_spread_markets_both_sides — returns
+    one home-side and one away-side spread per play. Live picker considers
+    both; backtest used to take only one, leaving roughly half the spread
+    candidates out of the pool."""
+    home_side = pick_spread_line(margin, [s for s in spread_specs if not s.flip])
+    away_side = pick_spread_line(margin, [s for s in spread_specs if s.flip])
+    return [s for s in (home_side, away_side) if s is not None]
+
+
 def _pick_ou_spec(total_runs: int, ou_specs: list[MarketSpec]) -> MarketSpec | None:
     return pick_ou_line(total_runs, ou_specs)
 
@@ -419,7 +446,16 @@ def _compute_gaps(rec, play_ts, play_times, idx):
         time_to_next_pitch = rec.next_pitch_ts - play_ts
     else:
         time_to_next_pitch = 9999
-    clean_cutoff = time_to_next_pitch - 5 if time_to_next_pitch < 9999 else 9999
+    # Live trader force-exits via IOC at CLEAN_WINDOW_SECONDS regardless of
+    # what the next pitch is doing; cap here so the backtest's fill window
+    # never exceeds what live would actually allow. The next-pitch − 5 floor
+    # still kicks in on busy ABs where the next pitch lands inside the
+    # CLEAN_WINDOW (we don't want to be measuring price through a follow-up
+    # event).
+    if time_to_next_pitch < 9999:
+        clean_cutoff = min(time_to_next_pitch - 5, CLEAN_WINDOW_SECONDS)
+    else:
+        clean_cutoff = CLEAN_WINDOW_SECONDS
     return time_to_next_ab, time_to_next_pitch, clean_cutoff
 
 
@@ -440,7 +476,7 @@ def sync_plays_with_trades(records, trades, spec=None, is_away_contract=False):
     play_times = _parse_play_times(records)
 
     for idx, (play_ts, rec) in enumerate(play_times):
-        entry_ts = play_ts - ENTRY_OFFSET
+        entry_ts = play_ts - _entry_offset()
         price_at = _find_price_at(trades, entry_ts)
         if price_at is None:
             continue
@@ -473,7 +509,7 @@ def sync_plays_dynamic_ou(records, ou_specs, ou_trades):
         if not trades:
             continue
 
-        entry_ts = play_ts - ENTRY_OFFSET
+        entry_ts = play_ts - _entry_offset()
         price_at = _find_price_at(trades, entry_ts)
         if price_at is None:
             continue
@@ -494,38 +530,44 @@ def sync_plays_dynamic_ou(records, ou_specs, ou_trades):
 
 
 def sync_plays_dynamic_spread(records, spread_specs, spread_trades):
-    """Sync plays against dynamically selected spread market per play."""
+    """Sync plays against dynamically selected spread markets per play.
+
+    Per play we evaluate up to TWO spread markets — one home-side, one
+    away-side — matching market_selector._pick_spread_markets_both_sides
+    in the live system. Each yields its own synced record so the candidate
+    pool downstream sees both options.
+    """
     synced = []
     play_times = _parse_play_times(records)
 
     for idx, (play_ts, rec) in enumerate(play_times):
         margin = rec.home_score - rec.away_score
-        spec = _pick_spread_spec(margin, spread_specs)
-        if spec is None:
-            continue
-
-        trades = spread_trades.get(spec.ticker)
-        if not trades:
-            continue
-
-        flip = spec.flip
-        sign = -1.0 if flip else 1.0
-
-        entry_ts = play_ts - ENTRY_OFFSET
-        price_at = _find_price_at(trades, entry_ts)
-        if price_at is None:
+        specs = _pick_spread_specs_both_sides(margin, spread_specs)
+        if not specs:
             continue
 
         time_to_next_ab, time_to_next_pitch, clean_cutoff = _compute_gaps(rec, play_ts, play_times, idx)
-        predicted = rec.model_deltas.get(spec.delta_key, 0)
+        entry_ts = play_ts - _entry_offset()
 
-        result = _build_synced_record(
-            rec, play_ts, entry_ts, price_at, predicted, sign, spec,
-            trades, clean_cutoff, time_to_next_ab, time_to_next_pitch,
-            market_type_override="spread",
-            market_label_override=f"SPR {spec.label.split()[-1]} (dynamic)",
-        )
-        if result:
-            synced.append(result)
+        for spec in specs:
+            trades = spread_trades.get(spec.ticker)
+            if not trades:
+                continue
+
+            sign = -1.0 if spec.flip else 1.0
+            price_at = _find_price_at(trades, entry_ts)
+            if price_at is None:
+                continue
+
+            predicted = rec.model_deltas.get(spec.delta_key, 0)
+
+            result = _build_synced_record(
+                rec, play_ts, entry_ts, price_at, predicted, sign, spec,
+                trades, clean_cutoff, time_to_next_ab, time_to_next_pitch,
+                market_type_override="spread",
+                market_label_override=f"SPR {spec.label.split()[-1]} (dynamic)",
+            )
+            if result:
+                synced.append(result)
 
     return synced

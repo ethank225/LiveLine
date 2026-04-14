@@ -24,9 +24,10 @@ from backtests.mlb import get_games_for_date, pull_play_by_play
 from backtests.enrichment import enrich_with_model
 from backtests.constants import (
     WINDOW_SECONDS, ENTRY_OFFSET, DEFAULT_ALPHA, DEFAULT_MAX_DOLLARS, ALPHAS,
+    CLEAN_WINDOW_SECONDS,
 )
 from backtests.kalshi_sync import (
-    set_trace_mode, set_stop_loss_analysis,
+    set_trace_mode, set_stop_loss_analysis, set_entry_offset,
     pull_kalshi_trades, sync_plays_with_trades,
     sync_plays_dynamic_ou, sync_plays_dynamic_spread,
 )
@@ -39,6 +40,7 @@ from backtests.reports import (
 from backtests.output import save_csv, print_trace, OUTPUT_DIR
 from backtests.multi_market import (
     run_comparison, print_comparison, write_trades_csv,
+    build_game_meta, print_per_game_summary, write_per_game_csv,
 )
 from backtests.report_io import capture_report, timestamped_path
 from backtests.cache import save_game_cache, load_game_cache, list_cached_games
@@ -84,6 +86,18 @@ def _main_inner():
     parser.add_argument("--no-fees", action="store_true",
                         help="Disable Kalshi fee deduction (for A/B against the "
                              "old fee-free backtest). Default: fees on.")
+    parser.add_argument("--no-blowout-filter", action="store_true",
+                        help="Disable the moneyline blowout filter (skip ML "
+                             "trades when |score margin| >= BLOWOUT_THRESHOLD). "
+                             "Mirrors live picker default; pass this flag to A/B "
+                             "against the unfiltered backtest.")
+    parser.add_argument("--entry-offset", type=int, default=None, metavar="SEC",
+                        help="Override ENTRY_OFFSET. Play timestamps are MLB "
+                             "about.endTime (scorer-logged play resolution). "
+                             "Positive = N seconds BEFORE that scorer log "
+                             "(matches real user clicks; default +5 from "
+                             "audit of 12 real taps). Negative = N seconds "
+                             "AFTER (slower than human reaction).")
     parser.add_argument("--use-cached", action="store_true",
                         help="Skip MLB+Kalshi API calls; reload plays/trades from "
                              "results/cache/ and rerun model + fill simulation.")
@@ -100,6 +114,8 @@ def _main_inner():
         set_trace_mode(True)
     if args.stop_loss_analysis:
         set_stop_loss_analysis(True)
+    if args.entry_offset is not None:
+        set_entry_offset(args.entry_offset)
 
     # --- Build list of dates ---
     if args.from_date:
@@ -118,8 +134,26 @@ def _main_inner():
 
     print(f"Backtesting {len(dates)} day(s): "
           f"{dates[0].isoformat()} — {dates[-1].isoformat()}")
-    print(f"Entry offset: {ENTRY_OFFSET}s before event | "
-          f"Exit window: {WINDOW_SECONDS}s after event")
+    eff_offset = args.entry_offset if args.entry_offset is not None else ENTRY_OFFSET
+    # Play timestamp = MLB about.endTime (scorer-logged play resolution).
+    # Audit of 12 real Kalshi taps showed users click ~5s BEFORE the scorer
+    # logs the play — so positive offset = ahead of scorer (matches reality),
+    # negative offset = behind scorer (slower than a human, peeked at scorer
+    # log to time entry).
+    if eff_offset > 0:
+        offset_desc = f"t-{eff_offset}s (ahead of scorer log)"
+    elif eff_offset == 0:
+        offset_desc = "t+0s (instant at scorer log)"
+    else:
+        offset_desc = f"t+{-eff_offset}s (behind scorer log)"
+    # Exit window is the LIVE clean-window timer that the backtest's
+    # `clean_cutoff` is also bounded by — that's what actually drives fill
+    # simulation. WINDOW_SECONDS is just a reporting bucket for the timing
+    # analysis, not the live exit deadline, so don't print it here.
+    print(
+        f"Entry offset: {offset_desc} | "
+        f"Exit window: {CLEAN_WINDOW_SECONDS}s (live timer)"
+    )
 
     # --- Init Kalshi client ---
     kalshi_client = None
@@ -135,6 +169,10 @@ def _main_inner():
 
     # --- Collect across all games ---
     all_synced: list[dict] = []
+    # Per-game metadata — final score, max lead, blowout flag — keyed by the
+    # same `game_tag` that lives on each synced record. Built during the
+    # per-game loop so the report can join trades back to game context.
+    games_meta: dict[str, dict] = {}
     total_games = 0
     total_plays = 0
     games_with_kalshi = 0
@@ -310,6 +348,9 @@ def _main_inner():
                 for r in game_synced:
                     r["game_tag"] = game_tag
                 all_synced.extend(game_synced)
+                # Stash game-level summary so the per-game P&L report can
+                # render scores + blowout flags without re-pulling MLB.
+                games_meta[game_tag] = build_game_meta(game_tag, game_info, records)
 
             save_csv(records, game_info, game_synced)
 
@@ -339,15 +380,20 @@ def _main_inner():
                 all_synced, args.alpha, args.max_dollars,
                 min_move=args.min_move_cents / 100.0,
                 fees_on=not args.no_fees,
+                blowout_filter=not args.no_blowout_filter,
             )
             print_comparison(single_trades, multi_trades,
                              args.alpha, args.max_dollars)
+            print_per_game_summary(single_trades, games_meta, mode_label="single-market")
             single_path = timestamped_path("multi_market_single_trades", "csv")
             multi_path = timestamped_path("multi_market_multi_trades", "csv")
+            per_game_path = timestamped_path("per_game_pnl_single", "csv")
             write_trades_csv(single_trades, single_path)
             write_trades_csv(multi_trades, multi_path)
+            write_per_game_csv(single_trades, games_meta, per_game_path)
             print(f"\nSaved single-mode trades: {single_path}")
             print(f"Saved multi-mode trades:  {multi_path}")
+            print(f"Saved per-game P&L:       {per_game_path}")
         if args.trace:
             print_trace(all_synced, args.trace)
     else:

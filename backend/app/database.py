@@ -304,6 +304,10 @@ def update_trade_status(
     status: str,
     exit_price: float | None = None,
     pnl: float | None = None,
+    *,
+    gross_pnl: float | None = None,
+    entry_fee: float | None = None,
+    exit_fee: float | None = None,
 ) -> None:
     logger.info(f"update_trade_status called (trade_id={trade_id} status={status})")
     client = _get_client()
@@ -318,7 +322,16 @@ def update_trade_status(
         if exit_price is not None:
             patch["exit_price"] = float(exit_price)
         if pnl is not None:
+            # realized_pnl is now net of fees (entry taker + exit maker/taker).
+            # Gross and the per-leg fees are stored alongside in the columns
+            # added by the schema migration below so nothing is lost.
             patch["realized_pnl"] = float(pnl)
+        if gross_pnl is not None:
+            patch["gross_pnl"] = float(gross_pnl)
+        if entry_fee is not None:
+            patch["entry_fee"] = float(entry_fee)
+        if exit_fee is not None:
+            patch["exit_fee"] = float(exit_fee)
         if status in ("filled", "expired", "stopped", "canceled", "canceled_by_user", "error"):
             patch["closed_at"] = _iso(datetime.now(timezone.utc))
         resp = client.table("trades").update(patch).eq("id", trade_id).execute()

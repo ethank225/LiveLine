@@ -44,7 +44,14 @@ HIGH_LEV_OU_PROXIMITY = 3
 # Backtest-specific
 # ---------------------------------------------------------------------------
 
-ENTRY_OFFSET = 5             # seconds before MLB event timestamp for entry
+ENTRY_OFFSET = 5             # seconds before MLB endTime. Play timestamps come
+                             # from MLB's `about.endTime` (when the scorer
+                             # finalized the play); audit of 12 real Kalshi
+                             # taps showed the user clicked a median of 5s
+                             # BEFORE that scorer entry — the scorer lags
+                             # reality. Setting +5 puts simulated entries at
+                             # the same offset relative to endTime that real
+                             # clicks landed. Override with `--entry-offset N`.
 CLEAN_BUFFER = 5             # seconds before next pitch to stop measuring
 WINDOW_SECONDS = 30          # default single-window comparison
 

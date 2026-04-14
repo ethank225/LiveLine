@@ -14,6 +14,7 @@ import {
   eventTypeStats,
 } from "./lib/merge.js";
 import { sortPlays } from "./lib/columns.js";
+import { downloadCSV } from "./lib/csv.js";
 import Header from "./components/Header.jsx";
 import SummaryBar from "./components/SummaryBar.jsx";
 import GroupToggle from "./components/GroupToggle.jsx";
@@ -89,6 +90,25 @@ export default function PnLTracker() {
                 count={filtered.length}
                 total={plays.length}
               />
+              <button
+                type="button"
+                className="export-btn"
+                onClick={() => {
+                  const stamp = new Date()
+                    .toISOString()
+                    .replace(/[-:]/g, "")
+                    .replace(/\.\d{3}Z$/, "Z");
+                  downloadCSV(sorted, `liveline-trades-${stamp}.csv`);
+                }}
+                disabled={sorted.length === 0}
+                title={
+                  sorted.length === 0
+                    ? "No trades to export"
+                    : `Export ${sorted.length} row${sorted.length === 1 ? "" : "s"} (current sort + filter)`
+                }
+              >
+                Export CSV
+              </button>
             </div>
             {EVENT_STATS.length > 0 && (
               <EventSummary

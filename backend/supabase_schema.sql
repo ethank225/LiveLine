@@ -123,6 +123,16 @@ create table if not exists public.trades (
 alter table public.trades
   add column if not exists undo_group_id uuid;
 
+-- P&L breakdown. `realized_pnl` is now the NET number (gross − entry_fee −
+-- exit_fee); the three new columns let analytics recover the gross trade
+-- and per-leg Kalshi fees without having to recompute. Entry is always a
+-- taker fee (IOC buy); exit is maker if the resting limit sell filled at
+-- target, taker if we IOC'd out (expire / stop-loss / undo).
+alter table public.trades
+  add column if not exists gross_pnl  numeric,
+  add column if not exists entry_fee  numeric,
+  add column if not exists exit_fee   numeric;
+
 create index if not exists trades_session_created_idx
   on public.trades (session_id, created_at);
 

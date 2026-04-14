@@ -22,37 +22,12 @@ import csv
 from collections import defaultdict
 from statistics import pstdev
 
-from backtests.constants import EVENT_ORDER
+from backtests.constants import EVENT_ORDER, BLOWOUT_THRESHOLD
+from app.fees import taker_fee, maker_fee
+from app.pnl import compute_fees, compute_gross
 
 MARKET_TYPES = ["moneyline", "over_under", "spread"]
 MARKET_LABELS = {"moneyline": "Moneyline", "over_under": "O/U", "spread": "Spread"}
-
-
-# ---------------------------------------------------------------------------
-# Fee + min-move constraints mirrored from the live system
-# ---------------------------------------------------------------------------
-
-# Kalshi taker fee: 7% × price × (1 − price) per contract, round up to a cent.
-# Verified against real fills (e.g. 7 @ $0.64 → $0.12, 35 @ $0.14 → $0.30).
-# Maker fees (resting limit orders) are ~0 — treat as zero.
-TAKER_FEE_RATE = 0.07
-
-
-def kalshi_fee(price: float, qty: int, role: str = "taker") -> float:
-    """Total fee (dollars) on `qty` contracts at `price`, rounded up to cents.
-
-    Kalshi charges the taker `0.07 × P × (1 − P)` per contract, rounded up
-    to the nearest cent per order. We approximate by rounding the total
-    up to the nearest cent (dominates in-contract rounding for any
-    realistic qty).
-    """
-    if role != "taker" or qty <= 0:
-        return 0.0
-    p = max(0.0, min(1.0, price))
-    raw = TAKER_FEE_RATE * p * (1.0 - p) * qty
-    # Kalshi rounds up to a full cent.
-    import math
-    return math.ceil(raw * 100) / 100
 
 
 # ---------------------------------------------------------------------------
@@ -72,17 +47,41 @@ def _sell_target(entry_price: float, predicted_delta: float, alpha: float) -> fl
     return entry_price + move if predicted_delta > 0 else entry_price - move
 
 
-def _build_candidates(group: list[dict], alpha: float, min_move: float = 0.0) -> list[dict]:
+def _build_candidates(
+    group: list[dict], alpha: float,
+    min_move: float = 0.0, blowout_filter: bool = True,
+) -> list[dict]:
     """From a set of synced records sharing the same play, build candidate trades.
 
     `min_move` (in dollars, e.g. 0.04) filters candidates whose expected
     entry→target move won't clear round-trip fees.
+
+    `blowout_filter` (default True) skips MONEYLINE candidates when the
+    score margin at this play is >= BLOWOUT_THRESHOLD — mirrors the live
+    picker's `compute_best_trades` gate at market_selector.py:724. O/U
+    and spread always trade because their lines still move in blowouts.
     """
+    # Plays in `group` share the same game state (they're the same play
+    # against different markets), so reading the score off the first record
+    # is sufficient — and matches what the live picker does in
+    # compute_best_trades, which gates moneyline candidates per-event using
+    # the current score.
+    is_blowout = False
+    if group:
+        first = group[0]
+        hs = first.get("home_score") or 0
+        as_ = first.get("away_score") or 0
+        is_blowout = abs(hs - as_) >= BLOWOUT_THRESHOLD
+
     seen_tickers: set[str] = set()
     out = []
     for rec in group:
         pred = rec.get("predicted_ml_delta") or 0.0
         if pred == 0:
+            continue
+        # Live picker's blowout gate is moneyline-only; totals and spreads
+        # still have edge because the line is still moving even in a 10-2.
+        if blowout_filter and is_blowout and rec.get("market_type") == "moneyline":
             continue
         entry = rec.get("price_before") or 0.0
         if entry <= 0 or _is_dead(entry, pred, alpha):
@@ -138,24 +137,55 @@ def _side_buy_price(cand: dict) -> float:
     return entry if cand["predicted_delta"] > 0 else round(1.0 - entry, 4)
 
 
+def _side_sell_target(cand: dict) -> float:
+    """Target sell price on the side actually traded.
+
+    Same identity used by the live picker: sell_target = entry + alpha*|delta|.
+    The fee base for the maker exit is this price on the traded side, not
+    the YES-ask-derived target stored in the candidate.
+    """
+    buy = _side_buy_price(cand)
+    return max(0.0, min(1.0, buy + cand["ev_per_contract"]))
+
+
+def _expected_net_profit(cand: dict, contracts: int) -> float:
+    """Net expected profit at `contracts` size, mirroring market_selector's
+    (sell_target - entry) * bet_size - taker_entry - maker_exit.
+
+    Used at selection time, before fills are known — so the exit leg is
+    assumed to fill as a maker limit at the target.
+    """
+    if contracts <= 0:
+        return 0.0
+    buy = _side_buy_price(cand)
+    sell = _side_sell_target(cand)
+    gross = (sell - buy) * contracts
+    return gross - taker_fee(contracts, buy) - maker_fee(contracts, sell)
+
+
 def _make_trade(cand: dict, budget: float, contracts: int, fees_on: bool) -> dict:
-    gross_pnl = contracts * cand["pnl_per_contract"]
+    # Gross comes straight off the fill sim (round-trip with Kalshi's own
+    # prices, no clamping). Fees use the clamped sell price because an
+    # out-of-range price would break the fee formula — but gross has no
+    # such concern, and clamping it would silently change P&L numbers
+    # that should track the simulation verbatim.
+    buy_price = _side_buy_price(cand)
+    sell_price_raw = buy_price + cand["pnl_per_contract"]
+    gross_pnl = compute_gross(buy_price, sell_price_raw, contracts)
     if fees_on and contracts > 0:
-        buy_price = _side_buy_price(cand)
-        # Sell price on the traded side = buy + per-contract pnl (same
-        # identity works for both YES and NO bets; see kalshi_sync notes).
-        sell_price = max(0.0, min(1.0, buy_price + cand["pnl_per_contract"]))
-        buy_fee = kalshi_fee(buy_price, contracts, "taker")
-        sell_role = "maker" if cand["filled"] else "taker"
-        sell_fee = kalshi_fee(sell_price, contracts, sell_role)
+        sell_price_clamped = max(0.0, min(1.0, sell_price_raw))
+        exit_type = "maker" if cand["filled"] else "taker"
+        buy_fee, sell_fee = compute_fees(
+            contracts, buy_price, sell_price_clamped, exit_type,
+        )
+        fees = round(buy_fee + sell_fee, 4)
     else:
-        buy_fee = sell_fee = 0.0
-    fees = round(buy_fee + sell_fee, 2)
+        buy_fee = sell_fee = fees = 0.0
     return {
         **cand,
         "contracts": contracts,
         "budget": budget,
-        "gross_pnl": round(gross_pnl, 4),
+        "gross_pnl": gross_pnl,
         "buy_fee": buy_fee,
         "sell_fee": sell_fee,
         "fees": fees,
@@ -163,28 +193,53 @@ def _make_trade(cand: dict, budget: float, contracts: int, fees_on: bool) -> dic
     }
 
 
+def _annotate_net_ev(candidates: list[dict], max_dollars: float, fees_on: bool) -> None:
+    """Attach contract count + net expected profit (pre-fill) to each candidate.
+
+    When fees_on=False we fall back to the old gross-EV ranking so the
+    --no-fees A/B comparison behaves like the pre-fee backtest.
+    """
+    for c in candidates:
+        contracts = int(max_dollars / _side_buy_price(c)) if _side_buy_price(c) > 0 else 0
+        c["_contracts_est"] = contracts
+        if fees_on:
+            c["net_expected_profit"] = _expected_net_profit(c, contracts)
+        else:
+            c["net_expected_profit"] = c["ev_per_contract"] * contracts
+
+
 def _execute_single(candidates: list[dict], max_dollars: float, fees_on: bool) -> list[dict]:
     if not candidates:
         return []
-    best = max(candidates, key=lambda c: c["ev_per_contract"])
-    if best["ev_per_contract"] <= 0:
+    _annotate_net_ev(candidates, max_dollars, fees_on)
+    # Rank by net expected profit (entry taker + exit maker accounted for),
+    # mirroring market_selector._evaluate_market / compute_best_trades. Kill
+    # any candidate that is gross-positive but net-negative.
+    viable = [c for c in candidates if c["net_expected_profit"] > 0]
+    if not viable:
         return []
-    contracts = int(max_dollars / _side_buy_price(best))
+    best = max(viable, key=lambda c: c["net_expected_profit"])
+    contracts = best["_contracts_est"]
     if contracts <= 0:
         return []
     return [_make_trade(best, max_dollars, contracts, fees_on)]
 
 
 def _execute_multi(candidates: list[dict], max_dollars: float, fees_on: bool) -> list[dict]:
-    positive = [c for c in candidates if c["ev_per_contract"] > 0]
+    _annotate_net_ev(candidates, max_dollars, fees_on)
+    # Same gate as single-mode: every basket member must clear fees on its own.
+    positive = [c for c in candidates if c["net_expected_profit"] > 0]
     if not positive:
         return []
-    total_ev = sum(c["ev_per_contract"] for c in positive)
-    if total_ev <= 0:
+    # Split budget proportional to net expected profit so better trades get
+    # a bigger slice (matches the spirit of the live multi-market split,
+    # which sizes by EV rather than a flat contracts-per-market).
+    total_weight = sum(c["net_expected_profit"] for c in positive)
+    if total_weight <= 0:
         return []
     trades = []
     for c in positive:
-        budget = max_dollars * (c["ev_per_contract"] / total_ev)
+        budget = max_dollars * (c["net_expected_profit"] / total_weight)
         contracts = int(budget / _side_buy_price(c))
         if contracts <= 0:
             continue
@@ -195,6 +250,7 @@ def _execute_multi(candidates: list[dict], max_dollars: float, fees_on: bool) ->
 def run_comparison(
     all_synced: list[dict], alpha: float, max_dollars: float,
     min_move: float = 0.04, fees_on: bool = True,
+    blowout_filter: bool = True,
 ) -> tuple[list[dict], list[dict]]:
     """Run both modes on the same candidate set. Returns (single, multi).
 
@@ -206,10 +262,27 @@ def run_comparison(
     groups = _group_by_play(all_synced)
     single_trades: list[dict] = []
     multi_trades: list[dict] = []
+    # Diagnostic: count candidates the fee filter kills (gross-positive but
+    # net-negative once entry taker + exit maker fees come off).
+    fee_killed_single = 0
+    fee_killed_multi = 0
     for group in groups.values():
-        candidates = _build_candidates(group, alpha, min_move=min_move)
+        candidates = _build_candidates(
+            group, alpha, min_move=min_move, blowout_filter=blowout_filter,
+        )
+        if candidates and fees_on:
+            _annotate_net_ev(candidates, max_dollars, fees_on)
+            killed = sum(
+                1 for c in candidates
+                if c["ev_per_contract"] > 0 and c["net_expected_profit"] <= 0
+            )
+            fee_killed_single += killed
+            fee_killed_multi += killed
         single_trades.extend(_execute_single(candidates, max_dollars, fees_on))
         multi_trades.extend(_execute_multi(candidates, max_dollars, fees_on))
+    if fees_on:
+        print(f"\nFee filter killed {fee_killed_single} gross-positive, "
+              f"net-negative candidates (per mode, same candidate set).")
     return single_trades, multi_trades
 
 
@@ -221,8 +294,9 @@ def _summarize(trades: list[dict]) -> dict:
     if not trades:
         return {"n": 0, "fill_rate": 0.0, "avg_profit_fill": 0.0,
                 "avg_loss_miss": 0.0, "ev_per_trade": 0.0,
-                "gross_pnl": 0.0, "fees": 0.0, "total_pnl": 0.0,
-                "win_rate": 0.0}
+                "gross_pnl": 0.0, "fees": 0.0,
+                "buy_fees": 0.0, "sell_fees": 0.0,
+                "total_pnl": 0.0, "win_rate": 0.0}
     n = len(trades)
     fills = [t for t in trades if t["filled"]]
     misses = [t for t in trades if not t["filled"]]
@@ -238,6 +312,8 @@ def _summarize(trades: list[dict]) -> dict:
         "ev_per_trade": sum(all_pnls) / n,
         "gross_pnl": sum(t.get("gross_pnl", t["pnl"]) for t in trades),
         "fees": sum(t.get("fees", 0.0) for t in trades),
+        "buy_fees": sum(t.get("buy_fee", 0.0) for t in trades),
+        "sell_fees": sum(t.get("sell_fee", 0.0) for t in trades),
         "total_pnl": sum(t["pnl"] for t in trades),
         "win_rate": 100 * winners / n,
     }
@@ -317,6 +393,10 @@ def print_comparison(
          _fmt_diff_pct(s['gross_pnl'], m['gross_pnl'])),
         ("Total fees", f"${s['fees']:,.0f}", f"${m['fees']:,.0f}",
          f"${m['fees'] - s['fees']:+,.0f}"),
+        ("  entry (taker)", f"${s['buy_fees']:,.0f}", f"${m['buy_fees']:,.0f}",
+         f"${m['buy_fees'] - s['buy_fees']:+,.0f}"),
+        ("  exit (maker/taker)", f"${s['sell_fees']:,.0f}", f"${m['sell_fees']:,.0f}",
+         f"${m['sell_fees'] - s['sell_fees']:+,.0f}"),
         ("Net P&L", f"${s['total_pnl']:+,.0f}", f"${m['total_pnl']:+,.0f}",
          _fmt_diff_pct(s['total_pnl'], m['total_pnl'])),
         ("Fee % of gross", _fee_pct(s['fees'], s['gross_pnl']),
@@ -381,9 +461,163 @@ _CSV_FIELDS = [
     "game_tag", "timestamp", "inning", "half", "event", "mlb_event",
     "market_type", "market_label", "market_ticker",
     "entry_price", "sell_target", "predicted_delta", "ev_per_contract",
+    "net_expected_profit",
     "contracts", "budget", "pnl_per_contract", "filled",
     "gross_pnl", "buy_fee", "sell_fee", "fees", "pnl",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Per-game summary
+# ---------------------------------------------------------------------------
+
+# Lead margin at any point in the game that classifies it as a blowout.
+# Live trader has BLOWOUT_THRESHOLD = 5 — keep this in sync with that gate.
+_BLOWOUT_MARGIN = 5
+
+_PER_GAME_CSV_FIELDS = [
+    "game_tag", "away", "home", "away_final", "home_final",
+    "max_lead", "blowout", "trades", "fills", "win_rate",
+    "gross_pnl", "fees", "net_pnl",
+]
+
+
+def _aggregate_by_game(trades: list[dict], games_meta: dict[str, dict]) -> list[dict]:
+    """Group trades by game_tag and join with per-game metadata.
+
+    `games_meta[game_tag]` carries the matchup, final score, and max-lead
+    margin computed from play-by-play. Games with zero trades are still
+    emitted (so a "no trades" game shows up in the report rather than
+    silently disappearing) — but only when meta exists for them, since
+    `all_synced` may be empty for games with no Kalshi data.
+    """
+    by_tag: dict[str, list[dict]] = defaultdict(list)
+    for t in trades:
+        tag = t["rec"].get("game_tag", "")
+        if tag:
+            by_tag[tag].append(t)
+
+    rows: list[dict] = []
+    for tag, meta in games_meta.items():
+        ts = by_tag.get(tag, [])
+        gross = sum(t.get("gross_pnl", 0.0) for t in ts)
+        fees = sum(t.get("fees", 0.0) for t in ts)
+        net = sum(t["pnl"] for t in ts)
+        fills = sum(1 for t in ts if t.get("filled"))
+        wins = sum(1 for t in ts if t["pnl"] > 0)
+        win_rate = (100.0 * wins / len(ts)) if ts else 0.0
+        rows.append({
+            "game_tag": tag,
+            "away": meta.get("away", ""),
+            "home": meta.get("home", ""),
+            "away_final": meta.get("away_final"),
+            "home_final": meta.get("home_final"),
+            "max_lead": meta.get("max_lead", 0),
+            "blowout": meta.get("max_lead", 0) >= _BLOWOUT_MARGIN,
+            "trades": len(ts),
+            "fills": fills,
+            "win_rate": win_rate,
+            "gross_pnl": round(gross, 2),
+            "fees": round(fees, 2),
+            "net_pnl": round(net, 2),
+        })
+    rows.sort(key=lambda r: r["net_pnl"])
+    return rows
+
+
+def print_per_game_summary(
+    trades: list[dict], games_meta: dict[str, dict], mode_label: str = "single-market",
+) -> None:
+    rows = _aggregate_by_game(trades, games_meta)
+    if not rows:
+        return
+    print(f"\n{'=' * 78}")
+    print(f"GAME-BY-GAME P&L ({mode_label} mode) — sorted by net P&L (worst first)")
+    print(f"{'=' * 78}")
+    print(f"  {'Matchup':<14} {'Score':<8} {'Trades':>6} {'Fills':>5} "
+          f"{'Gross':>9} {'Fees':>8} {'Net P&L':>10}  Notes")
+    print(f"  {'-' * 76}")
+    for r in rows:
+        if r["away_final"] is not None and r["home_final"] is not None:
+            score = f"{r['away_final']}-{r['home_final']}"
+        else:
+            score = "—"
+        matchup = f"{r['away']}@{r['home']}"
+        notes = "blowout" if r["blowout"] else ""
+        print(
+            f"  {matchup:<14} {score:<8} {r['trades']:>6} {r['fills']:>5} "
+            f"${r['gross_pnl']:>+8,.0f} ${r['fees']:>7,.0f} "
+            f"${r['net_pnl']:>+9,.0f}  {notes}"
+        )
+    # Totals
+    tot_trades = sum(r["trades"] for r in rows)
+    tot_fills = sum(r["fills"] for r in rows)
+    tot_gross = sum(r["gross_pnl"] for r in rows)
+    tot_fees = sum(r["fees"] for r in rows)
+    tot_net = sum(r["net_pnl"] for r in rows)
+    print(f"  {'-' * 76}")
+    print(
+        f"  {'TOTAL':<14} {'':<8} {tot_trades:>6} {tot_fills:>5} "
+        f"${tot_gross:>+8,.0f} ${tot_fees:>7,.0f} "
+        f"${tot_net:>+9,.0f}"
+    )
+
+
+def write_per_game_csv(
+    trades: list[dict], games_meta: dict[str, dict], filepath,
+) -> None:
+    rows = _aggregate_by_game(trades, games_meta)
+    with open(filepath, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_PER_GAME_CSV_FIELDS)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({
+                "game_tag": r["game_tag"],
+                "away": r["away"],
+                "home": r["home"],
+                "away_final": r["away_final"] if r["away_final"] is not None else "",
+                "home_final": r["home_final"] if r["home_final"] is not None else "",
+                "max_lead": r["max_lead"],
+                "blowout": "true" if r["blowout"] else "false",
+                "trades": r["trades"],
+                "fills": r["fills"],
+                "win_rate": round(r["win_rate"], 1),
+                "gross_pnl": r["gross_pnl"],
+                "fees": r["fees"],
+                "net_pnl": r["net_pnl"],
+            })
+
+
+def build_game_meta(
+    game_tag: str, game_info: dict, records: list,
+) -> dict:
+    """Extract per-game summary fields from raw MLB pull. `records` is the
+    PlayRecord list before sync; we read home_score/away_score off each one
+    to compute max lead — that's the score *before* the play, so we also
+    fold in the final to catch a last-play margin spike.
+    """
+    max_lead = 0
+    for r in records:
+        hs = getattr(r, "home_score", 0) or 0
+        as_ = getattr(r, "away_score", 0) or 0
+        margin = abs(hs - as_)
+        if margin > max_lead:
+            max_lead = margin
+    home_final = game_info.get("home_final")
+    away_final = game_info.get("away_final")
+    if home_final is not None and away_final is not None:
+        margin = abs(home_final - away_final)
+        if margin > max_lead:
+            max_lead = margin
+    away = game_info.get("away_abbr", "")
+    home = game_info.get("home_abbr", "")
+    return {
+        "away": away,
+        "home": home,
+        "away_final": away_final,
+        "home_final": home_final,
+        "max_lead": max_lead,
+    }
 
 
 def write_trades_csv(trades: list[dict], filepath) -> None:
@@ -406,6 +640,7 @@ def write_trades_csv(trades: list[dict], filepath) -> None:
                 "sell_target": round(t["sell_target"], 4),
                 "predicted_delta": round(t["predicted_delta"], 4),
                 "ev_per_contract": round(t["ev_per_contract"], 4),
+                "net_expected_profit": round(t.get("net_expected_profit", 0.0), 4),
                 "contracts": t["contracts"],
                 "budget": round(t["budget"], 2),
                 "pnl_per_contract": round(t["pnl_per_contract"], 4),

@@ -16,6 +16,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from app import trader, market_selector
+from app.fees import maker_fee, taker_fee
+
+
+def _net_pnl_maker(entry: float, exit_: float, qty: int) -> float:
+    """Expected realized_pnl: (exit-entry)*qty minus taker entry + maker exit."""
+    gross = (exit_ - entry) * qty
+    return round(gross - taker_fee(qty, entry) - maker_fee(qty, exit_), 4)
 from app.trader import (
     Trade,
     _registry_lock,
@@ -89,6 +96,9 @@ def _make_open_trade(
     t.status = status
     t.sell_order_id = sell_order_id
     t.realized_pnl = None
+    t.gross_pnl = 0.0
+    t.entry_fee = 0.0
+    t.exit_fee = 0.0
     t.exit_price = None
     t.completed_at = None
     t.buy_order_id = "buy-xyz"
@@ -132,9 +142,10 @@ class TestHappyPath:
         dispatch_websocket_fill(_fake_msg("sim-happy-1"))
 
         assert t.status == "filled"
-        # P&L = (sell_target - entry_price) * quantity
+        # realized_pnl is net of Kalshi fees: (sell_target - entry)*qty
+        # minus taker entry + maker exit. Matches the backtest's pnl field.
         assert t.realized_pnl == pytest.approx(
-            (0.60 - 0.50) * 100, rel=1e-6
+            _net_pnl_maker(0.50, 0.60, 100), rel=1e-6
         )
         assert t.exit_price == 0.60
         assert t.completed_at is not None
@@ -342,7 +353,7 @@ class TestActualExitPrice:
 
         assert t.status == "filled"
         assert t.exit_price == 0.65
-        assert t.realized_pnl == pytest.approx((0.65 - 0.50) * 100)
+        assert t.realized_pnl == pytest.approx(_net_pnl_maker(0.50, 0.65, 100))
         t._update_db_status.assert_called_once_with("filled", 0.65, t.realized_pnl)
 
     def test_rest_vwap_partial_fill_qty_wins(self, monkeypatch, mock_sse):
@@ -357,7 +368,7 @@ class TestActualExitPrice:
         dispatch_websocket_fill(_fake_msg("sim-live-2"))
 
         assert t.exit_price == 0.62
-        assert t.realized_pnl == pytest.approx((0.62 - 0.50) * 80)
+        assert t.realized_pnl == pytest.approx(_net_pnl_maker(0.50, 0.62, 80))
 
     def test_ws_payload_used_when_rest_unavailable(self, monkeypatch, mock_sse):
         """get_order_fill_vwap returning None (transient REST failure)
@@ -370,7 +381,7 @@ class TestActualExitPrice:
         dispatch_websocket_fill(msg)
 
         assert t.exit_price == 0.63
-        assert t.realized_pnl == pytest.approx((0.63 - 0.50) * 100)
+        assert t.realized_pnl == pytest.approx(_net_pnl_maker(0.50, 0.63, 100))
 
     def test_no_side_flips_yes_price(self, monkeypatch, mock_sse):
         """WS payload carries yes_price_dollars; for a NO trade, exit is
@@ -387,7 +398,7 @@ class TestActualExitPrice:
         dispatch_websocket_fill(msg)
 
         assert t.exit_price == 0.72
-        assert t.realized_pnl == pytest.approx((0.72 - 0.63) * 100)
+        assert t.realized_pnl == pytest.approx(_net_pnl_maker(0.63, 0.72, 100))
 
     def test_full_fallback_emits_warning(self, monkeypatch, mock_sse, caplog):
         """Both REST and WS payload unavailable — book at sell_target and

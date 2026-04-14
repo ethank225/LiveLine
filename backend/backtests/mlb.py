@@ -154,7 +154,12 @@ def pull_play_by_play(game_id: int) -> tuple[list[PlayRecord], dict]:
         inning = about.get("inning", 1)
         half_raw = about.get("halfInning", "top")
         half = "top" if half_raw == "top" else "bot"
-        timestamp = about.get("startTime", "")
+        # `endTime` is when the at-bat resolved (ball was hit / strike-three).
+        # `startTime` is when the batter walked up — typically 30-90s earlier
+        # for a multi-pitch AB, which made `entry_ts = play_ts - ENTRY_OFFSET`
+        # peek deep into the future. `endTime` is the only timestamp that
+        # makes ENTRY_OFFSET represent reaction delay honestly.
+        timestamp = about.get("endTime", "")
 
         if inning != cur_inning or half != cur_half:
             cur_inning = inning
@@ -206,7 +211,7 @@ def pull_play_by_play(game_id: int) -> tuple[list[PlayRecord], dict]:
     for play_idx, play in enumerate(all_plays):
         if rec_idx >= len(records):
             break
-        about_ts = play.get("about", {}).get("startTime", "")
+        about_ts = play.get("about", {}).get("endTime", "")
         if about_ts == records[rec_idx].timestamp:
             for future in range(play_idx + 1, len(all_plays)):
                 if first_pitch_ts[future] is not None:
