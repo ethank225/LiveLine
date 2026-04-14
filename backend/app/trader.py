@@ -745,7 +745,12 @@ class Trade:
         # executed. Cancel-404 or position=0 are both definitive. Selling
         # contracts we don't hold creates a phantom fill / short position.
         if self._sell_already_filled():
-            self._mark_filled_at_target()
+            resolved = self._resolve_actual_exit_price()
+            if resolved is None:
+                self._mark_filled_at_target()
+            else:
+                price, qty = resolved
+                self._mark_filled_at_target(actual_price=price, actual_qty=qty)
             return
 
         with self._lock:
@@ -843,7 +848,12 @@ class Trade:
                         f"{self._log_prefix} FILL tick-detected "
                         f"bid=${bid:.2f} ≥ target=${self.sell_target:.2f}"
                     )
-                    self._mark_filled_at_target()
+                    resolved = self._resolve_actual_exit_price()
+                    if resolved is None:
+                        self._mark_filled_at_target()
+                    else:
+                        price, qty = resolved
+                        self._mark_filled_at_target(actual_price=price, actual_qty=qty)
                     return
 
         if not self._settings.get("use_stop_loss", True):
@@ -863,7 +873,12 @@ class Trade:
         # filled at target. If so, record the profitable fill rather than
         # selling phantom contracts.
         if self._sell_already_filled():
-            self._mark_filled_at_target()
+            resolved = self._resolve_actual_exit_price()
+            if resolved is None:
+                self._mark_filled_at_target()
+            else:
+                price, qty = resolved
+                self._mark_filled_at_target(actual_price=price, actual_qty=qty)
             return
 
         with self._lock:
@@ -1014,9 +1029,56 @@ class Trade:
         except Exception:
             return 0.0
 
-    def _mark_filled_at_target(self) -> None:
-        """Finalize the trade as 'filled' at sell_target. Used when we
-        detect the limit sell already executed on Kalshi.
+    def _resolve_actual_exit_price(self, ws_msg=None) -> tuple[float, int] | None:
+        """Return (per_contract_vwap, qty) for the resting limit sell's
+        execution, in this trade's side-units. None if the real fill data
+        isn't retrievable — caller falls back to sell_target.
+
+        Source priority:
+          1. REST /portfolio/fills via `kalshi.get_order_fill_vwap` —
+             authoritative, captures partial fills at multiple levels and
+             maker price improvement.
+          2. WS FillMessage payload (`yes_price_dollars` / `count_fp`) —
+             single-fill fallback when REST is unavailable; fine for the
+             common case where the limit sell filled in one chunk.
+
+        Dry-run short-circuits to None so sim behavior is unchanged.
+        """
+        if bool(self._settings.get("dry_run", True)):
+            return None
+        if not self.sell_order_id:
+            return None
+
+        try:
+            vwap_qty = kalshi.get_order_fill_vwap(self.sell_order_id, self.side)
+        except Exception as e:
+            logger.error(f"{self._log_prefix} get_order_fill_vwap failed: {e}")
+            vwap_qty = None
+        if vwap_qty is not None:
+            return vwap_qty
+
+        if ws_msg is not None:
+            try:
+                yes_price_raw = getattr(ws_msg, "yes_price_dollars", None)
+                count_raw = getattr(ws_msg, "count_fp", None)
+                if yes_price_raw is not None and count_raw is not None:
+                    yes_price = float(yes_price_raw)
+                    qty = int(float(count_raw))
+                    if qty > 0:
+                        per_contract = round(
+                            yes_price if self.side == "YES" else 1.0 - yes_price, 4
+                        )
+                        return (per_contract, qty)
+            except (TypeError, ValueError) as e:
+                logger.error(f"{self._log_prefix} parse ws fill payload: {e}")
+        return None
+
+    def _mark_filled_at_target(
+        self, *, actual_price: float | None = None, actual_qty: int | None = None,
+    ) -> None:
+        """Finalize the trade as 'filled'. Prefers `actual_price` (real
+        Kalshi execution) over `sell_target` (posted limit) so logged
+        P&L matches the audit.
 
         Reachable from three threads now: the clean-window timer, the
         price-tick probe, and the websocket fill dispatcher. The first
@@ -1027,14 +1089,26 @@ class Trade:
         and nesting those inside self._lock would invert the acquisition
         order used elsewhere.
         """
-        exit_price = self.sell_target
+        if actual_price is None:
+            exit_price = self.sell_target
+            # Degraded row — execution price unavailable. Tag loudly so
+            # CSV/Kalshi drift is grep-able without new instrumentation.
+            if not bool(self._settings.get("dry_run", True)):
+                logger.warning(
+                    f"{self._log_prefix} FILL exit-price fallback sell_order_id="
+                    f"{self.sell_order_id} — logging sell_target=${self.sell_target:.2f}"
+                )
+        else:
+            exit_price = actual_price
+        qty = actual_qty if actual_qty is not None else self.quantity
+
         with self._lock:
             if self.status != "open":
                 # Another path (timer / stop-loss / websocket) already
                 # claimed the transition. No-op.
                 return
             self.status = "filled"
-            self.realized_pnl = round((exit_price - self.entry_price) * self.quantity, 2)
+            self.realized_pnl = round((exit_price - self.entry_price) * qty, 2)
             self.exit_price = exit_price
             self.completed_at = datetime.utcnow()
         # Lock released — safe to do side-effects that may take other locks.
@@ -1042,7 +1116,7 @@ class Trade:
             self._clean_timer.cancel()
         logger.info(
             f"{self._log_prefix} RESOLVED filled pnl={_fmt_pnl(self.realized_pnl)} "
-            f"(qty={self.quantity} @${exit_price:.2f})"
+            f"(qty={qty} @${exit_price:.2f})"
         )
         self._update_db_status("filled", exit_price, self.realized_pnl)
         self._notify_resolved()
@@ -1063,7 +1137,12 @@ class Trade:
         logger.info(
             f"{self._log_prefix} FILL ws-detected order_id={oid}"
         )
-        self._mark_filled_at_target()
+        resolved = self._resolve_actual_exit_price(ws_msg=msg)
+        if resolved is None:
+            self._mark_filled_at_target()
+        else:
+            price, qty = resolved
+            self._mark_filled_at_target(actual_price=price, actual_qty=qty)
 
     # -- Safety net --------------------------------------------------------
 

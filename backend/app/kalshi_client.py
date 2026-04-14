@@ -617,6 +617,45 @@ class KalshiManager:
                 return None
             raise
 
+    def get_order_fill_vwap(
+        self, order_id: str, side: str, use_demo: bool = False,
+    ) -> tuple[float, int] | None:
+        """Return (per_contract_vwap, total_qty) for every fill on `order_id`,
+        in `side`-units (YES price for YES, 1.0 - yes_price for NO).
+
+        Authoritative source for exit-price logging when a limit sell has
+        already filled: Kalshi aggregates partial fills server-side and
+        echoes per-fill `yes_price_dollars` / `count_fp`, so a VWAP here
+        captures both maker price improvement and multi-level partials.
+
+        Returns None on lookup failure or zero fills — caller should fall
+        back to the intent price (sell_target) and surface a warning."""
+        client = self._account_client(use_demo)
+        if not client:
+            return None
+        try:
+            fills = client.portfolio.get_fills(order_id=order_id, fetch_all=True)
+        except Exception as e:
+            logger.error(f"get_order_fill_vwap({order_id}): {e}")
+            return None
+        total_cost = 0.0
+        total_qty = 0
+        for f in fills:
+            try:
+                qty = int(float(getattr(f, "count_fp", 0) or 0))
+                yes_price = float(getattr(f, "yes_price_dollars", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:
+                continue
+            per_contract = yes_price if side == "YES" else 1.0 - yes_price
+            total_cost += per_contract * qty
+            total_qty += qty
+        if total_qty == 0:
+            return None
+        vwap = round(total_cost / total_qty, 4)
+        return (vwap, total_qty)
+
     def _account_client(self, use_demo: bool) -> KalshiClient | None:
         """Pick which client to use for account queries (balance/positions)."""
         if use_demo and self.demo_client is not None:

@@ -110,10 +110,16 @@ def _make_open_trade(
     return t
 
 
-def _fake_msg(order_id):
-    """Minimal stand-in for pykalshi's FillMessage — dispatcher only
-    touches .order_id. Matches the shape produced by the live feed."""
-    return SimpleNamespace(order_id=order_id)
+def _fake_msg(order_id, *, yes_price_dollars=None, count_fp=None, side=None):
+    """Minimal stand-in for pykalshi's FillMessage. Dispatcher only
+    touches .order_id; the resolver additionally reads yes_price_dollars
+    and count_fp when falling back to the WS payload as the price source."""
+    return SimpleNamespace(
+        order_id=order_id,
+        yes_price_dollars=yes_price_dollars,
+        count_fp=count_fp,
+        side=side,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +323,87 @@ class TestConcurrency:
         assert t.status == "filled"
         assert t._update_db_status.call_count == 1
         assert mock_sse.call_count == 1
+
+
+class TestActualExitPrice:
+    """The resting limit sell can fill above sell_target (maker price
+    improvement) or across multiple levels (partial fills). `exit_price`
+    / `realized_pnl` should reflect the real Kalshi execution, not the
+    intent price. Dry-run skips the lookup entirely (no real order to
+    ask about) — these tests run with dry_run=False."""
+
+    def test_rest_vwap_overrides_sell_target(self, monkeypatch, mock_sse):
+        t = _make_open_trade("sim-live-1", dry_run=False)
+        monkeypatch.setattr(
+            trader.kalshi, "get_order_fill_vwap",
+            lambda order_id, side: (0.65, 100),
+        )
+        dispatch_websocket_fill(_fake_msg("sim-live-1"))
+
+        assert t.status == "filled"
+        assert t.exit_price == 0.65
+        assert t.realized_pnl == pytest.approx((0.65 - 0.50) * 100)
+        t._update_db_status.assert_called_once_with("filled", 0.65, t.realized_pnl)
+
+    def test_rest_vwap_partial_fill_qty_wins(self, monkeypatch, mock_sse):
+        """If the resting sell partial-filled (80 of 100), Kalshi's fills
+        endpoint reports qty=80 and we book P&L on those 80 contracts,
+        not self.quantity."""
+        t = _make_open_trade("sim-live-2", dry_run=False)
+        monkeypatch.setattr(
+            trader.kalshi, "get_order_fill_vwap",
+            lambda order_id, side: (0.62, 80),
+        )
+        dispatch_websocket_fill(_fake_msg("sim-live-2"))
+
+        assert t.exit_price == 0.62
+        assert t.realized_pnl == pytest.approx((0.62 - 0.50) * 80)
+
+    def test_ws_payload_used_when_rest_unavailable(self, monkeypatch, mock_sse):
+        """get_order_fill_vwap returning None (transient REST failure)
+        falls back to the WS message's own price/count."""
+        t = _make_open_trade("sim-live-3", dry_run=False)
+        monkeypatch.setattr(
+            trader.kalshi, "get_order_fill_vwap", lambda order_id, side: None
+        )
+        msg = _fake_msg("sim-live-3", yes_price_dollars="0.63", count_fp="100")
+        dispatch_websocket_fill(msg)
+
+        assert t.exit_price == 0.63
+        assert t.realized_pnl == pytest.approx((0.63 - 0.50) * 100)
+
+    def test_no_side_flips_yes_price(self, monkeypatch, mock_sse):
+        """WS payload carries yes_price_dollars; for a NO trade, exit is
+        stored in NO units (1 - yes_price) to match entry_price units."""
+        t = _make_open_trade("sim-live-4", dry_run=False)
+        t.side = "NO"
+        t.entry_price = 0.63
+        t.sell_target = 0.70
+        monkeypatch.setattr(
+            trader.kalshi, "get_order_fill_vwap", lambda order_id, side: None
+        )
+        # Real fill: YES=0.28 → NO = 0.72.
+        msg = _fake_msg("sim-live-4", yes_price_dollars="0.28", count_fp="100")
+        dispatch_websocket_fill(msg)
+
+        assert t.exit_price == 0.72
+        assert t.realized_pnl == pytest.approx((0.72 - 0.63) * 100)
+
+    def test_full_fallback_emits_warning(self, monkeypatch, mock_sse, caplog):
+        """Both REST and WS payload unavailable — book at sell_target and
+        log a warning so the degraded row is grep-able."""
+        import logging
+        t = _make_open_trade("sim-live-5", dry_run=False)
+        monkeypatch.setattr(
+            trader.kalshi, "get_order_fill_vwap", lambda order_id, side: None
+        )
+        with caplog.at_level(logging.WARNING, logger="app.trader"):
+            dispatch_websocket_fill(_fake_msg("sim-live-5"))
+
+        assert t.exit_price == 0.60  # sell_target
+        assert any(
+            "exit-price fallback" in r.message for r in caplog.records
+        )
 
 
 class TestIndexCleanup:
