@@ -42,11 +42,6 @@ class EventDelta:
     delta: float                                # moneyline delta
     over_under: dict = field(default_factory=dict)   # {"7.5": {"before","after","delta"}}
     spread: dict = field(default_factory=dict)       # {"-1.5": {"before","after","delta"}}
-    # True when applying this event would end the game via a walk-off
-    # (bottom of 9+, tied/home-trailing pre-event, home leads post-event).
-    # The market settles to $1/$0 instead of trading the target price, so
-    # trade selection filters these out.
-    walkoff_risk: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +460,6 @@ def compute_deltas(
             new_we = 0.0
             ou_after_acc: dict[str, float] = {str(line): 0.0 for line in use_ou}
             sp_after_acc: dict[str, float] = {str(line): 0.0 for line in use_sp}
-            any_walkoff = False
 
             for prob, new_bases, runs in outcomes:
                 new_sd = _apply_score(state, runs)
@@ -473,7 +467,6 @@ def compute_deltas(
                 # Walk-off can occur per-outcome if this run takes the lead.
                 if ns.half == "bot" and ns.inning >= 9 and ns.score_diff > 0:
                     we_o = 1.0
-                    any_walkoff = True
                 else:
                     we_o = get_win_expectancy(ns)
                 new_we += prob * we_o
@@ -517,27 +510,21 @@ def compute_deltas(
                 delta=round(new_we - current_we, 4),
                 over_under=ou_dict,
                 spread=sp_dict,
-                walkoff_risk=any_walkoff,
             ))
             continue
 
         new_we = get_win_expectancy(new_state)
-        walkoff_risk = False
 
         # Walk-off: bottom 9+, home takes the lead on THIS play → game over
         if new_state.half == "bot" and new_state.inning >= 9 and new_state.score_diff > 0:
             new_we = 1.0
-            walkoff_risk = True
 
-        # 3rd out in bottom 9+ (detected by inning flipping to top). Market
-        # settles to $1/$0 the same as a walk-off, so flag it too.
+        # 3rd out in bottom 9+ (detected by inning flipping to top)
         if state.half == "bot" and state.inning >= 9 and new_state.half == "top":
             if new_state.score_diff > 0:
-                new_we = 1.0
-                walkoff_risk = True
+                new_we = 1.0   # home was winning → game over, home wins
             elif new_state.score_diff < 0:
-                new_we = 0.0
-                walkoff_risk = True
+                new_we = 0.0   # home was losing → game over, home loses
             # score_diff == 0 → tied, goes to extras (flip to top 10 is correct)
 
         if include_markets:
@@ -588,7 +575,6 @@ def compute_deltas(
             delta=round(new_we - current_we, 4),
             over_under=ou_dict,
             spread=sp_dict,
-            walkoff_risk=walkoff_risk,
         ))
 
     return deltas
