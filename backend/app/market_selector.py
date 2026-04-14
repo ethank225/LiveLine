@@ -705,6 +705,17 @@ def compute_best_trades(
         # basket; single-market mode just picks the winner.
         candidates: list[dict] = []
 
+        # Walk-off / game-ending plays: market settles to $1/$0 instead of
+        # trading to the target price, so there's no 45s sell window. Skip
+        # every market for this event and emit an empty trade.
+        if getattr(d, "walkoff_risk", False):
+            empty = _empty_trade(d.event, bet_size)
+            empty["all_trades"] = []
+            empty["home_abbr"] = home_abbr
+            empty["away_abbr"] = away_abbr
+            result[d.event] = empty
+            continue
+
         # --- Moneyline candidates ---
         if not (blowout_filter and is_blowout):
             for ml in ml_markets:

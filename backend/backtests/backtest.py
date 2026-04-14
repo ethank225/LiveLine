@@ -78,6 +78,12 @@ def _main_inner():
                         help=f"Alpha for single/multi-market comparison (default: {DEFAULT_ALPHA}).")
     parser.add_argument("--max-dollars", type=float, default=DEFAULT_MAX_DOLLARS,
                         help=f"Per-play budget for comparison (default: ${DEFAULT_MAX_DOLLARS:.0f}).")
+    parser.add_argument("--min-move-cents", type=int, default=4,
+                        help="Skip trades whose expected entry→target move is "
+                             "below N cents (mirrors live min_move_cents; default 4).")
+    parser.add_argument("--no-fees", action="store_true",
+                        help="Disable Kalshi fee deduction (for A/B against the "
+                             "old fee-free backtest). Default: fees on.")
     parser.add_argument("--use-cached", action="store_true",
                         help="Skip MLB+Kalshi API calls; reload plays/trades from "
                              "results/cache/ and rerun model + fill simulation.")
@@ -330,7 +336,10 @@ def _main_inner():
             print_flagged_summary(all_synced)
         if args.multi_market:
             single_trades, multi_trades = run_comparison(
-                all_synced, args.alpha, args.max_dollars)
+                all_synced, args.alpha, args.max_dollars,
+                min_move=args.min_move_cents / 100.0,
+                fees_on=not args.no_fees,
+            )
             print_comparison(single_trades, multi_trades,
                              args.alpha, args.max_dollars)
             single_path = timestamped_path("multi_market_single_trades", "csv")
