@@ -136,6 +136,93 @@ def _fake_msg(order_id, *, yes_price_dollars=None, count_fp=None, side=None):
 # Tests
 # ---------------------------------------------------------------------------
 
+class TestExpectedPnlRecompute:
+    """market_selector hands Trade a trade_info dict with entry_fee_est,
+    exit_fee_est, and net_expected_profit computed at a constant notional
+    (bet_size=100) for ranking fairness. Before the row hits the DB we
+    overwrite those keys with qty-adjusted numbers that match the real
+    fill. Without this the DB stores values 5-10× too high for typical
+    book-depth-limited fills (e.g. $10.09 net for an 18-contract trade
+    that actually nets ~$0.25)."""
+
+    def _bare_trade(self, *, entry, target, quantity, notional_info):
+        t = Trade.__new__(Trade)
+        t.entry_price = entry
+        t.sell_target = target
+        t.quantity = quantity
+        t.trade_info = dict(notional_info)
+        return t
+
+    def test_overwrites_notional_with_qty_adjusted_values(self):
+        # Reproduce the bug from live data: market_selector logged bet_size=100
+        # notional ($1.60 / $0.31 / $10.09) for a trade that actually filled
+        # at qty=18 ($0.29 / $0.06 / $0.25).
+        notional = {
+            "entry_fee_est": 1.60,
+            "exit_fee_est": 0.31,
+            "net_expected_profit": 10.09,
+            "some_other_field": "preserved",
+        }
+        t = self._bare_trade(entry=0.65, target=0.77, quantity=18, notional_info=notional)
+        t._recompute_expected_pnl()
+
+        # Taker fee on 18 @ 0.65 = ceil(0.07*18*0.65*0.35*100) = 29¢
+        assert t.trade_info["entry_fee_est"] == pytest.approx(0.29)
+        # Maker fee on 18 @ 0.77 = ceil(0.0175*18*0.77*0.23*100) = 6¢
+        assert t.trade_info["exit_fee_est"] == pytest.approx(0.06)
+        # Net = (0.77-0.65)*18 - 0.29 - 0.06 = 2.16 - 0.35 = 1.81
+        assert t.trade_info["net_expected_profit"] == pytest.approx(1.81)
+        # Unrelated keys preserved (dict is mutated in place, not replaced).
+        assert t.trade_info["some_other_field"] == "preserved"
+
+    def test_second_user_trade_qty_27(self):
+        # Second real example from the audit.
+        notional = {
+            "entry_fee_est": 1.72,
+            "exit_fee_est": 0.44,
+            "net_expected_profit": 5.84,
+        }
+        t = self._bare_trade(entry=0.43, target=0.51, quantity=27, notional_info=notional)
+        t._recompute_expected_pnl()
+
+        # Taker on 27 @ 0.43 = ceil(0.07*27*0.43*0.57*100) = 47¢
+        assert t.trade_info["entry_fee_est"] == pytest.approx(0.47)
+        # Maker on 27 @ 0.51 = ceil(0.0175*27*0.51*0.49*100) = 12¢
+        assert t.trade_info["exit_fee_est"] == pytest.approx(0.12)
+        # Net = (0.51-0.43)*27 - 0.47 - 0.12 = 2.16 - 0.59 = 1.57
+        assert t.trade_info["net_expected_profit"] == pytest.approx(1.57)
+
+    def test_zero_qty_produces_zero_estimates(self):
+        """Cancel / no_fill paths leave self.quantity at its default 0.
+        Logged estimates should all be 0 (no trade, no fees) rather than
+        the stale bet_size-notional values."""
+        notional = {
+            "entry_fee_est": 1.60,
+            "exit_fee_est": 0.31,
+            "net_expected_profit": 10.09,
+        }
+        t = self._bare_trade(entry=0.65, target=0.77, quantity=0, notional_info=notional)
+        t._recompute_expected_pnl()
+
+        assert t.trade_info["entry_fee_est"] == 0.0
+        assert t.trade_info["exit_fee_est"] == 0.0
+        assert t.trade_info["net_expected_profit"] == 0.0
+
+    def test_kalshi_real_fee_examples(self):
+        """Cross-check against real Kalshi fees from the April 13 game
+        audit the user pulled: the bug was in the CALLER passing bet_size,
+        not in the fee formulas. These assertions catch a regression that
+        breaks the underlying taker_fee / maker_fee math."""
+        # 7 @ $0.64 buy: real Kalshi fee $0.12
+        t = self._bare_trade(entry=0.64, target=0.70, quantity=7, notional_info={})
+        t._recompute_expected_pnl()
+        assert t.trade_info["entry_fee_est"] == pytest.approx(0.12)
+        # 32 @ $0.61 buy: real Kalshi fee $0.54
+        t = self._bare_trade(entry=0.61, target=0.67, quantity=32, notional_info={})
+        t._recompute_expected_pnl()
+        assert t.trade_info["entry_fee_est"] == pytest.approx(0.54)
+
+
 class TestHappyPath:
     def test_dispatch_transitions_to_filled(self, mock_sse):
         t = _make_open_trade("sim-happy-1")
@@ -334,6 +421,44 @@ class TestConcurrency:
         assert t.status == "filled"
         assert t._update_db_status.call_count == 1
         assert mock_sse.call_count == 1
+
+
+class TestDryRunTickFill:
+    """In dry-run, no real order exists to ride the tick probe, but if the
+    market best bid reaches sell_target inside the clean window we should
+    still close the trade as 'filled' (maker exit fee) — otherwise every
+    dry-run trade times out as 'expired' and sim P&L is systematically
+    worse than live. Previously `on_price_tick` early-returned on
+    dry_run=True, which is what we're verifying changed."""
+
+    def test_dry_run_bid_at_target_marks_filled(self, mock_sse):
+        t = _make_open_trade("sim-dry-1", dry_run=True)
+        # Tick arrives with bid exactly at target.
+        t.on_price_tick(0.60)
+
+        assert t.status == "filled"
+        assert t.exit_price == 0.60  # sell_target
+        # Net P&L applies maker exit fee — matches real-trade math.
+        assert t.realized_pnl == pytest.approx(_net_pnl_maker(0.50, 0.60, 100))
+        t._update_db_status.assert_called_once_with("filled", 0.60, t.realized_pnl)
+
+    def test_dry_run_bid_below_target_does_not_fill(self, mock_sse):
+        t = _make_open_trade("sim-dry-2", dry_run=True)
+        # One cent below target — simulated maker sell would not fill.
+        t.on_price_tick(0.59)
+
+        assert t.status == "open"
+        assert t.realized_pnl is None
+        t._update_db_status.assert_not_called()
+
+    def test_dry_run_bid_above_target_fills(self, mock_sse):
+        """Market ran past target — maker sell fills at sell_target price
+        (our resting limit), not the higher bid. Live behavior matches."""
+        t = _make_open_trade("sim-dry-3", dry_run=True)
+        t.on_price_tick(0.75)
+
+        assert t.status == "filled"
+        assert t.exit_price == 0.60  # still the resting-limit price
 
 
 class TestActualExitPrice:

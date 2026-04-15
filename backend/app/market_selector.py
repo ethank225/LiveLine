@@ -616,9 +616,18 @@ def _evaluate_market(
         )
         return None
 
-    # Fee-aware net expected profit. Entry is Taker (we hit the book); exit is
-    # Maker (our sell target is a resting limit). `bet_size` is contracts, not
-    # dollars — see constants.DEFAULT_BET_SIZE.
+    # Fee-aware net expected profit at a CONSTANT NOTIONAL of `bet_size`
+    # contracts. This is a ranking signal — all candidates are compared at
+    # the same notional so the picker can pick the best one fairly. Do NOT
+    # read these numbers as "what this specific trade will net in dollars":
+    # the actual fill qty is determined at execute time by sizing, which
+    # is book-depth and max_slippage limited. Trade._recompute_expected_pnl
+    # in app/trader.py overwrites the matching keys in the returned dict
+    # with qty-adjusted values before they reach the DB.
+    #
+    # Entry is Taker (we cross the book); exit is Maker (our sell target
+    # is a resting limit). `bet_size` is contracts — see
+    # constants.DEFAULT_BET_SIZE.
     entry_fee = taker_fee(contracts=bet_size, price_dollars=best["entry_price"])
     exit_fee = maker_fee(contracts=bet_size, price_dollars=best["sell_target"])
     net_expected_profit = (

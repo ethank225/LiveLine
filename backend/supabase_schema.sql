@@ -133,6 +133,19 @@ alter table public.trades
   add column if not exists entry_fee  numeric,
   add column if not exists exit_fee   numeric;
 
+-- Picker annotations. market_selector stamps these on every trade at
+-- creation time so post-hoc analysis can reconstruct WHY the picker
+-- chose this trade (fee-aware vs gross-EV ranking) and what it expected
+-- the P&L to be. `*_est` values are now qty-adjusted in Trade._log_to_db
+-- (prior versions wrote bet_size-notional numbers that were 5-10× too
+-- high; see backend/app/trader.py::_recompute_expected_pnl).
+alter table public.trades
+  add column if not exists entry_fee_est       numeric,
+  add column if not exists exit_fee_est        numeric,
+  add column if not exists net_expected_profit numeric,
+  add column if not exists fee_adjusted        boolean,
+  add column if not exists gross_pick_ticker   text;
+
 create index if not exists trades_session_created_idx
   on public.trades (session_id, created_at);
 

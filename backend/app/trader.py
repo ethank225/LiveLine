@@ -42,7 +42,7 @@ from app.pnl import compute_net
 
 logger = logging.getLogger(__name__)
 
-_TERMINAL_STATUSES = {"filled", "stopped", "expired", "canceled", "canceled_by_user", "error"}
+_TERMINAL_STATUSES = {"filled", "stopped", "expired", "canceled", "canceled_by_user", "error", "no_fill"}
 
 
 # ---------------------------------------------------------------------------
@@ -586,16 +586,30 @@ class Trade:
             _active_tickers.add(self.market_ticker)
             self._owns_ticker_claim = True
 
+        # Dynamic slippage tolerance: high-conviction trades (big expected
+        # move) can afford to pay more at entry because the target is
+        # further away. Formula is 15% of the expected entry→target move,
+        # floored at 1¢, capped at the user's configured hard limit. Uses
+        # the signal-time entry price (picker's `best["entry_price"]`,
+        # stored in trade_info) because `self.entry_price` isn't the vwap
+        # until sizing returns.
+        signal_entry = float(self.trade_info.get("entry_price") or 0.0)
+        predicted_move_cents = round(abs(self.sell_target - signal_entry) * 100)
+        dynamic_slippage = max(1, int(predicted_move_cents * 0.15))
+        actual_slippage = min(dynamic_slippage, self.max_slippage_cents)
+
         sizing = kalshi.calculate_position_size(
             self.market_ticker, self.side,
-            self.max_dollars, self.max_slippage_cents,
+            self.max_dollars, actual_slippage,
         )
         quantity = sizing["contracts"]
         if quantity == 0:
             # Preserve historical "no liquidity" error path.
             raise RuntimeError(
                 f"No liquidity on {self.market_ticker} {self.side} "
-                f"within {self.max_slippage_cents}¢ slippage"
+                f"within {actual_slippage}¢ slippage "
+                f"(dynamic from {predicted_move_cents}¢ predicted move, "
+                f"capped at {self.max_slippage_cents}¢)"
             )
 
         self.requested_quantity = quantity
@@ -625,7 +639,31 @@ class Trade:
         dry_run = bool(self._settings.get("dry_run", True))
 
         # --- IOC buy ---
-        buy_price = round(sizing["best_ask"] + self.max_slippage_cents / 100, 2)
+        buy_price = round(sizing["best_ask"] + actual_slippage / 100, 2)
+
+        # Dry-run entry validation. A live IOC buy that's limited to
+        # `buy_price` fills nothing if the book has moved past that limit
+        # between sizing and execution. `sizing` is fresh here, so this
+        # catches the race where market moved during the few ms between
+        # sizing and this check — same outcome a real order would see.
+        # The no_fill status keeps these separate from user-canceled rows
+        # so sim-P&L reports can distinguish "book moved on us" from
+        # "user undid the trade".
+        if dry_run:
+            fresh = kalshi.get_prices(self.market_ticker)
+            current_ask = fresh["yes_ask"] if self.side == "YES" else fresh["no_ask"]
+            if current_ask <= 0 or current_ask > buy_price:
+                logger.info(
+                    f"{self._log_prefix} DRY-RUN BUY {self._short} → no_fill "
+                    f"(current ask ${current_ask:.2f} > limit ${buy_price:.2f})"
+                )
+                with self._lock:
+                    self.status = "no_fill"
+                self._log_to_db()
+                self._update_db_status("no_fill")
+                self._notify_resolved()
+                return self
+
         buy_result = _place_order(
             market_ticker=self.market_ticker,
             action="buy",
@@ -845,10 +883,28 @@ class Trade:
             if self.status != "open":
                 return
 
-        # Fill probe — only when bid actually reaches the target, and at
-        # most once every ~2s so a rapid flurry of ticks doesn't hammer
-        # /portfolio/positions.
-        if bid >= self.sell_target and not bool(self._settings.get("dry_run", True)):
+        # Fill probe — only when bid actually reaches the target.
+        if bid >= self.sell_target:
+            dry_run = bool(self._settings.get("dry_run", True))
+            if dry_run:
+                # No live order to check; if the market best bid reached our
+                # target during the clean window, a real resting limit sell
+                # would have filled at the maker rate. Mirror that so dry-run
+                # P&L shows "filled at target" trades instead of everything
+                # timing out as "expired" via the 45s IOC path.
+                with self._lock:
+                    if self.status != "open":
+                        return
+                logger.info(
+                    f"{self._log_prefix} DRY-RUN FILL tick-detected "
+                    f"bid=${bid:.2f} ≥ target=${self.sell_target:.2f}"
+                )
+                # _mark_filled_at_target uses `sell_target` as the exit price
+                # when no actual_price is provided, and _finalize_pnl applies
+                # the maker exit fee — exactly the real-fill semantics.
+                self._mark_filled_at_target()
+                return
+            # --- real-money path: throttle position lookups to once / 2s ---
             import time as _time
             now = _time.monotonic()
             if now - self._last_fill_probe_ts >= 2.0:
@@ -1196,9 +1252,37 @@ class Trade:
 
     # -- Supabase ----------------------------------------------------------
 
+    def _recompute_expected_pnl(self):
+        """Overwrite the bet_size-notional estimates that market_selector
+        stashed in `self.trade_info` with qty-adjusted values now that
+        sizing has run.
+
+        market_selector computes fees and net_expected_profit at a constant
+        notional (bet_size, default 100) so candidates rank fairly against
+        each other. But by the time a trade hits the DB, the actual fill
+        qty is known — and real fees scale per-contract, so the stored
+        estimate should use self.quantity. Without this, a 100-contract
+        notional produces $1.60 entry_fee_est where an 18-contract real
+        fill actually costs $0.29, and the logged net_expected_profit is
+        5–10× too high.
+
+        Safe on every lifecycle path. Cancel / no-fill rows (qty=0) yield
+        all-zero estimates, which correctly reflects "no trade happened."
+        Uses the same `compute_net` helper `_finalize_pnl` calls at
+        resolution, so the "expected" number in the DB is directly
+        comparable to `realized_pnl`.
+        """
+        expected = compute_net(
+            self.entry_price, self.sell_target, self.quantity, exit_type="maker",
+        )
+        self.trade_info["entry_fee_est"] = expected["entry_fee"]
+        self.trade_info["exit_fee_est"] = expected["exit_fee"]
+        self.trade_info["net_expected_profit"] = expected["net"]
+
     def _log_to_db(self):
         """Insert the initial trades row. Populates self.trade_db_id.
         Single INSERT now that `log_trade` takes `undo_group_id` directly."""
+        self._recompute_expected_pnl()
         try:
             tid = db.log_trade(
                 session_id=self.session_id,

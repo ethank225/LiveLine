@@ -332,7 +332,7 @@ def update_trade_status(
             patch["entry_fee"] = float(entry_fee)
         if exit_fee is not None:
             patch["exit_fee"] = float(exit_fee)
-        if status in ("filled", "expired", "stopped", "canceled", "canceled_by_user", "error"):
+        if status in ("filled", "expired", "stopped", "canceled", "canceled_by_user", "error", "no_fill"):
             patch["closed_at"] = _iso(datetime.now(timezone.utc))
         resp = client.table("trades").update(patch).eq("id", trade_id).execute()
         logger.info(f"update_trade_status: patched trade {trade_id} → {status} ({len(resp.data or [])} rows)")
