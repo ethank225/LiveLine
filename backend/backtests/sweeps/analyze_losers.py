@@ -36,8 +36,11 @@ from pathlib import Path
 DEFAULT_EXIT_WINDOW = 30
 ENTRY_OFFSET_DEFAULT = 5  # seconds before play_ts (matches current default)
 
-CACHE_ROOT = Path(__file__).parent / "results" / "cache"
-REPORTS_DIR = Path(__file__).parent / "reports"
+# parents[1] walks up: sweeps/ → backtests/. results/ and reports/ live
+# under backtests/, not under sweeps/.
+_BACKTESTS_ROOT = Path(__file__).resolve().parents[1]
+CACHE_ROOT = _BACKTESTS_ROOT / "results" / "cache"
+REPORTS_DIR = _BACKTESTS_ROOT / "reports"
 
 # Worst 3 + best 1 from the last 3-day backtest (per_game_pnl_single CSV).
 TARGETS = [

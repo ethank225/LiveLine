@@ -20,30 +20,32 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from backtests.mlb import get_games_for_date, pull_play_by_play
-from backtests.enrichment import enrich_with_model
-from backtests.constants import (
+from backtests.core.mlb import get_games_for_date, pull_play_by_play
+from backtests.core.enrichment import enrich_with_model
+from backtests.core.constants import (
     WINDOW_SECONDS, ENTRY_OFFSET, DEFAULT_ALPHA, DEFAULT_MAX_DOLLARS, ALPHAS,
     CLEAN_WINDOW_SECONDS,
 )
-from backtests.kalshi_sync import (
+from backtests.core.kalshi_sync import (
     set_trace_mode, set_stop_loss_analysis, set_entry_offset,
     pull_kalshi_trades, sync_plays_with_trades,
     sync_plays_dynamic_ou, sync_plays_dynamic_spread,
 )
-from backtests.discovery import get_kalshi_client, find_kalshi_event_ticker, discover_game_markets
-from backtests.reports import (
+from backtests.core.discovery import get_kalshi_client, find_kalshi_event_ticker, discover_game_markets
+from backtests.reporting.reports import (
     print_play_log, print_play_gap_stats, print_stop_loss_analysis,
     write_stop_loss_csv, print_flagged_summary,
     print_accuracy_summary, print_timing_analysis,
 )
-from backtests.output import save_csv, print_trace, OUTPUT_DIR
-from backtests.multi_market import (
+from backtests.reporting.output import save_csv, print_trace, OUTPUT_DIR
+from backtests.core.multi_market import (
     run_comparison, print_comparison, write_trades_csv,
     build_game_meta, print_per_game_summary, write_per_game_csv,
 )
-from backtests.report_io import capture_report, timestamped_path
-from backtests.cache import save_game_cache, load_game_cache, list_cached_games
+from backtests.reporting.report_io import capture_report, timestamped_path
+from backtests.core.cache import (
+    save_game_cache, load_game_cache, list_cached_games, is_game_cached,
+)
 
 
 def main():
@@ -101,6 +103,11 @@ def _main_inner():
     parser.add_argument("--use-cached", action="store_true",
                         help="Skip MLB+Kalshi API calls; reload plays/trades from "
                              "results/cache/ and rerun model + fill simulation.")
+    parser.add_argument("--refresh-cache", action="store_true",
+                        help="Force re-fetch from MLB + Kalshi even when the "
+                             "game is already cached. Default behavior is to "
+                             "skip already-cached games (no API call, no "
+                             "re-save) so reruns are cheap and idempotent.")
     args = parser.parse_args()
 
     if args.use_cached and args.mlb_only:
@@ -209,12 +216,29 @@ def _main_inner():
             cached_specs: list = []
             cached_trades: dict[str, list[tuple[int, float]]] = {}
 
-            if args.use_cached:
+            # Use cache if forced (--use-cached) OR if a cache entry already
+            # exists for this game and the user hasn't asked to refresh.
+            # This makes reruns idempotent: a date range that's already been
+            # backtested incurs zero API calls and zero re-saves the second
+            # time. `--refresh-cache` is the escape hatch for a forced re-pull.
+            use_cache_for_this_game = (
+                args.use_cached
+                or (not args.refresh_cache and is_game_cached(target, game_id))
+            )
+
+            if use_cache_for_this_game:
                 loaded = load_game_cache(target, game_id)
                 if loaded is None:
+                    # Only reachable via --use-cached (else is_game_cached
+                    # returned True and the file must exist). Forced-cache
+                    # path with a missing entry — skip cleanly.
                     print(f"  [{game_id}] no cache entry — skipping")
                     continue
                 game_info, records, cached_specs, cached_trades = loaded
+                if not args.use_cached:
+                    # Distinguishes auto-skip (this branch) from the
+                    # explicit --use-cached banner printed above.
+                    print(f"  [{game_id}] already cached — skipping fetch")
             else:
                 try:
                     records, game_info = pull_play_by_play(game_id)
@@ -239,7 +263,7 @@ def _main_inner():
             run_specs: list = []
             run_trades: dict[str, list[tuple[int, float]]] = {}
 
-            if args.use_cached:
+            if use_cache_for_this_game:
                 ml_specs = [s for s in cached_specs if s.market_type == "moneyline"]
                 ou_specs = [s for s in cached_specs if s.market_type == "over_under"]
                 spread_specs = [s for s in cached_specs if s.market_type == "spread"]
@@ -355,7 +379,11 @@ def _main_inner():
             save_csv(records, game_info, game_synced)
 
             # Persist raw inputs so future runs can replay with --use-cached.
-            if not args.use_cached:
+            # Skip the save when we used cached data — re-writing the same
+            # bytes is wasted I/O, and on the auto-skip path `run_specs`/
+            # `run_trades` are empty (no API calls were made), so writing
+            # them would clobber the existing cache with empties.
+            if not use_cache_for_this_game:
                 save_game_cache(target, game_id, game_info, records,
                                 run_specs, run_trades)
 

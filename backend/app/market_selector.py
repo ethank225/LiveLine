@@ -175,13 +175,6 @@ _teams_lock = threading.Lock()
 _trade_cache: dict[int, dict] = {}
 _cache_lock = threading.Lock()
 
-# Throttle for periodic market snapshots. compute_best_trades runs on every
-# price tick (~5 Hz); writing a snapshot every call would flood Supabase.
-# One entry per game so multi-game sessions don't starve each other.
-_SNAPSHOT_INTERVAL_SECONDS = 30.0
-_last_snapshot_time: dict[int, float] = {}
-_snapshot_time_lock = threading.Lock()
-
 
 def set_game_deltas(game_id: int, deltas: list[EventDelta]):
     """Store the latest engine deltas for a game (called from main.py)."""
@@ -900,84 +893,7 @@ def compute_best_trades(
     with _cache_lock:
         _trade_cache[game_id] = result
 
-    # Periodic throttled snapshot — gives us 30 s continuous market data
-    # without flooding Supabase on every tick. Trade-time snapshots
-    # (called from execute_trade) remain for exact-at-decision rows.
-    _maybe_snapshot(game_id, markets)
-
     return result
-
-
-def _maybe_snapshot(game_id: int, markets: list["MarketInfo"]) -> None:
-    """Write a snapshot for this game iff >= 30 s since the last one."""
-    if not markets:
-        return
-    import time
-    now = time.monotonic()
-    with _snapshot_time_lock:
-        last = _last_snapshot_time.get(game_id, 0.0)
-        if (now - last) < _SNAPSHOT_INTERVAL_SECONDS:
-            return
-        _last_snapshot_time[game_id] = now
-
-    rows: list[dict] = []
-    for m in markets:
-        try:
-            prices = kalshi.get_prices(m.ticker)
-            rows.append({
-                "market_ticker": m.ticker,
-                "yes_bid": prices.get("yes_bid"),
-                "yes_ask": prices.get("yes_ask"),
-                "market_type": m.market_type,
-            })
-        except Exception:
-            continue
-    if not rows:
-        return
-    t = threading.Thread(
-        target=db.log_market_snapshots,
-        args=(game_id, rows),
-        daemon=True,
-    )
-    t.start()
-
-
-def snapshot_markets_for_game(game_id: int) -> None:
-    """
-    Snapshot the current orderbook of every market for a game.
-
-    Called from trader.execute_trade AFTER a buy fills, so each row in
-    market_snapshots represents the board state at a trading decision
-    point — entry prices, spreads, and the alternatives the user didn't
-    pick. Roughly 20 rows per trade, not per tick.
-
-    Writes run on a daemon thread so Supabase latency never blocks the
-    caller (which is on the /buy request path).
-    """
-    with _market_lock:
-        markets = list(_game_markets.get(game_id, []))
-    if not markets:
-        return
-    rows: list[dict] = []
-    for m in markets:
-        try:
-            prices = kalshi.get_prices(m.ticker)
-            rows.append({
-                "market_ticker": m.ticker,
-                "yes_bid": prices.get("yes_bid"),
-                "yes_ask": prices.get("yes_ask"),
-                "market_type": m.market_type,
-            })
-        except Exception:
-            continue
-    if not rows:
-        return
-    t = threading.Thread(
-        target=db.log_market_snapshots,
-        args=(game_id, rows),
-        daemon=True,
-    )
-    t.start()
 
 
 # ---------------------------------------------------------------------------

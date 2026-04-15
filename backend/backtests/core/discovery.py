@@ -4,7 +4,7 @@ import os
 from datetime import date
 from pathlib import Path
 
-from backtests.mlb import MarketSpec
+from backtests.core.mlb import MarketSpec
 
 
 def get_kalshi_client():
@@ -25,7 +25,8 @@ def get_kalshi_client():
 
     key_file = Path(key_path)
     if not key_file.is_absolute():
-        key_file = Path(__file__).parent.parent / key_path
+        # parents[2]: core/ → backtests/ → backend/ (PEMs live at backend/).
+        key_file = Path(__file__).resolve().parents[2] / key_path
 
     return KC(api_key_id=api_key, private_key_path=str(key_file), demo=demo)
 

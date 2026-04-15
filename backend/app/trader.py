@@ -710,12 +710,38 @@ class Trade:
 
         self._log_to_db()
 
-        # Trade-time market snapshot — captures the board at decision time.
+        # Depth snapshot for the traded ticker. Records top-5 bid/ask so
+        # post-game analysis can answer "how deep was the book here?"
+        # without replaying the websocket. Fire-and-forget daemon thread
+        # so Supabase latency never blocks the trade path. Skipped when:
+        #   - trade_db_id is None (DB insert failed, no FK target), or
+        #   - local book is empty (freshly subscribed, no snapshot yet).
         try:
-            from app.market_selector import snapshot_markets_for_game
-            snapshot_markets_for_game(self.game_id)
+            if self.trade_db_id is None:
+                logger.info(
+                    f"{self._log_prefix} orderbook snapshot skipped: "
+                    f"trade_db_id is None"
+                )
+            else:
+                book = kalshi.get_orderbook_snapshot(
+                    self.market_ticker, self.side, levels=5,
+                )
+                if not book["bids"] and not book["asks"]:
+                    logger.info(
+                        f"{self._log_prefix} orderbook snapshot skipped: "
+                        f"empty local book for {self.market_ticker}"
+                    )
+                else:
+                    threading.Thread(
+                        target=db.log_orderbook_snapshot,
+                        args=(
+                            self.trade_db_id, self.game_id,
+                            self.market_ticker, self.side, book,
+                        ),
+                        daemon=True,
+                    ).start()
         except Exception as e:
-            logger.error(f"snapshot_markets_for_game failed: {e}")
+            logger.error(f"log_orderbook_snapshot dispatch failed: {e}")
 
         logger.info(
             f"{self._log_prefix} BUY {filled_qty} {self.side} {self._short} "

@@ -4,9 +4,11 @@ import csv
 from datetime import datetime, timezone
 from pathlib import Path
 
-from backtests.constants import EXIT_WINDOWS, ALPHAS, ENTRY_OFFSET
+from backtests.core.constants import EXIT_WINDOWS, ALPHAS, ENTRY_OFFSET
 
-OUTPUT_DIR = Path(__file__).parent / "results"
+# `results/` lives at the backtests package root (backtests/results/),
+# one level above this reporting/ subpackage.
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "results"
 
 
 def save_csv(records, game_info, synced):

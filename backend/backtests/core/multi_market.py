@@ -22,7 +22,7 @@ import csv
 from collections import defaultdict
 from statistics import pstdev
 
-from backtests.constants import EVENT_ORDER, BLOWOUT_THRESHOLD
+from backtests.core.constants import EVENT_ORDER, BLOWOUT_THRESHOLD
 from app.fees import taker_fee, maker_fee
 from app.pnl import compute_fees, compute_gross
 

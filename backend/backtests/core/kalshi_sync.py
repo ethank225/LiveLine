@@ -2,8 +2,8 @@
 
 from datetime import datetime
 
-from backtests.mlb import PlayRecord, MarketSpec
-from backtests.constants import (
+from backtests.core.mlb import PlayRecord, MarketSpec
+from backtests.core.constants import (
     EXIT_WINDOWS, ENTRY_OFFSET, CLEAN_BUFFER, WINDOW_SECONDS,
     CLEAN_WINDOW_SECONDS,
     ALPHAS, STOP_LEVELS,

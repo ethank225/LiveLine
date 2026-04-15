@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from backtests.constants import (
+from backtests.core.constants import (
     EXIT_WINDOWS, ENTRY_OFFSET, ALPHAS, STOP_LEVELS, CONTRACTS,
     HIGH_LEV_ML_THRESHOLD, HIGH_LEV_OU_PROXIMITY,
     WINDOW_PCTS, WINDOW_LABELS, EVENT_ORDER,
@@ -340,7 +340,7 @@ def print_stop_loss_analysis(synced):
               f"{avg:>+8.4f} ${total:>+7.0f}")
 
 
-from backtests.constants import BLOWOUT_THRESHOLD, THIN_THRESHOLDS
+from backtests.core.constants import BLOWOUT_THRESHOLD, THIN_THRESHOLDS
 
 
 def _compute_flags(s):

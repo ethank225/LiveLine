@@ -7,7 +7,10 @@ from pathlib import Path
 
 import statsapi
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# parents[2]: core/ → backtests/ → backend/. Adds backend/ to sys.path so
+# `from app.constants import ...` resolves when this module is imported
+# via `python -m backtests.backtest`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 # Maps MLB Stats API result['event'] strings to our engine event codes
 EVENT_MAP = {

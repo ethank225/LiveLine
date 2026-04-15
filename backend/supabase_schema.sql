@@ -164,28 +164,42 @@ create index if not exists trades_undo_group_idx
   where undo_group_id is not null;
 
 -- ============================================================
--- market_snapshots
--- Kalshi orderbook state each time compute_best_trades runs.
--- Keyed by game_id only — markets are shared across users, so
--- tying them to a session would either duplicate rows or leave
--- snapshots orphaned when nobody's connected.
+-- orderbook_snapshots
+-- Top-5 bid/ask depth captured once per trade at execute time.
+-- Links to trades(id) so post-hoc analysis can join outcomes to the
+-- exact book state that produced them. Answers "how deep was the bid
+-- book when I entered?" and "what did I pay to walk the ask stack?".
 -- ============================================================
-create table if not exists public.market_snapshots (
-  id             uuid primary key default gen_random_uuid(),
-  game_id        integer not null,
-  timestamp      timestamptz not null default now(),
-  market_ticker  text not null,
-  yes_bid        numeric,
-  yes_ask        numeric,
-  spread         numeric,
-  market_type    text
+create table if not exists public.orderbook_snapshots (
+  id              uuid primary key default gen_random_uuid(),
+  trade_id        uuid references public.trades(id) on delete cascade,
+  game_id         integer not null,
+  market_ticker   text not null,
+  side            text not null,           -- YES / NO, matches trade.side
+  timestamp       timestamptz not null default now(),
+
+  -- Top-5 bid / ask levels in the trade's side-units. Level N is NULL
+  -- if the book is thinner than N levels deep.
+  bid_1_price numeric, bid_1_qty integer,
+  bid_2_price numeric, bid_2_qty integer,
+  bid_3_price numeric, bid_3_qty integer,
+  bid_4_price numeric, bid_4_qty integer,
+  bid_5_price numeric, bid_5_qty integer,
+  ask_1_price numeric, ask_1_qty integer,
+  ask_2_price numeric, ask_2_qty integer,
+  ask_3_price numeric, ask_3_qty integer,
+  ask_4_price numeric, ask_4_qty integer,
+  ask_5_price numeric, ask_5_qty integer,
+
+  -- Totals across the WHOLE book (not just top 5) so depth summaries
+  -- don't hide deep liquidity beyond the logged levels.
+  total_bid_depth integer,
+  total_ask_depth integer
 );
 
-create index if not exists market_snapshots_game_time_idx
-  on public.market_snapshots (game_id, timestamp desc);
-
-create index if not exists market_snapshots_ticker_time_idx
-  on public.market_snapshots (market_ticker, timestamp desc);
+create index if not exists ob_snap_trade_idx
+  on public.orderbook_snapshots (trade_id)
+  where trade_id is not null;
 
 -- ============================================================
 -- Row Level Security
@@ -193,10 +207,10 @@ create index if not exists market_snapshots_ticker_time_idx
 -- These policies only control what an authenticated end user
 -- can read via the client SDK / PostgREST with their JWT.
 -- ============================================================
-alter table public.users            enable row level security;
-alter table public.sessions         enable row level security;
-alter table public.trades           enable row level security;
-alter table public.market_snapshots enable row level security;
+alter table public.users               enable row level security;
+alter table public.sessions            enable row level security;
+alter table public.trades              enable row level security;
+alter table public.orderbook_snapshots enable row level security;
 
 -- users: read your own row
 drop policy if exists users_select_own on public.users;
@@ -213,11 +227,29 @@ drop policy if exists trades_select_own on public.trades;
 create policy trades_select_own on public.trades
   for select using (user_id = auth.uid());
 
--- market_snapshots: any authenticated user can read (not PII)
-drop policy if exists market_snapshots_select_auth on public.market_snapshots;
-create policy market_snapshots_select_auth on public.market_snapshots
-  for select using (auth.role() = 'authenticated');
+-- orderbook_snapshots: scoped to the owning trade's user. Orphan rows
+-- (trade_id IS NULL) are never returned because the EXISTS fails — which
+-- is the intended fail-closed behavior.
+drop policy if exists orderbook_snapshots_select_own on public.orderbook_snapshots;
+create policy orderbook_snapshots_select_own on public.orderbook_snapshots
+  for select using (
+    trade_id is not null
+    and exists (
+      select 1 from public.trades t
+      where t.id = orderbook_snapshots.trade_id
+        and t.user_id = auth.uid()
+    )
+  );
 
 -- No insert/update/delete policies for the anon or authenticated
 -- roles on any of these tables. All writes MUST go through the
 -- backend using SUPABASE_SERVICE_KEY.
+
+-- ============================================================
+-- Cleanup: drop legacy market_snapshots table.
+-- Earlier versions wrote top-of-book YES prices every 30s and at trade
+-- time; superseded by orderbook_snapshots (per-trade top-5 depth).
+-- Kept as an idempotent DROP so re-running this schema on a deployed
+-- DB sheds the old table + its indexes in one pass.
+-- ============================================================
+drop table if exists public.market_snapshots cascade;

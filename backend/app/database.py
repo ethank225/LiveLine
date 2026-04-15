@@ -430,32 +430,45 @@ def _as_float(v) -> float:
         return 0.0
 
 
-def log_market_snapshots(game_id: int, snapshots: list[dict]) -> None:
-    """Batch-insert market snapshots. Each dict needs:
-    market_ticker, yes_bid, yes_ask, market_type."""
+def log_orderbook_snapshot(
+    trade_id: str,
+    game_id: int,
+    market_ticker: str,
+    side: str,
+    book: dict,
+) -> None:
+    """Flatten a top-N `book` dict from `kalshi.get_orderbook_snapshot`
+    into a single `orderbook_snapshots` row keyed by `trade_id`.
+
+    `book` shape: {"bids": [(price, qty), ...], "asks": [...],
+    "total_bid_depth": int, "total_ask_depth": int}. Levels beyond what
+    the book actually had are left NULL — the schema allows it.
+    """
     client = _get_client()
-    if client is None or not snapshots:
+    if client is None or not trade_id:
         return
     try:
-        rows = []
-        for s in snapshots:
-            try:
-                yes_bid = s.get("yes_bid")
-                yes_ask = s.get("yes_ask")
-                spread = None
-                if yes_bid is not None and yes_ask is not None:
-                    spread = round(float(yes_ask) - float(yes_bid), 4)
-                rows.append({
-                    "game_id": int(game_id),
-                    "market_ticker": s.get("market_ticker"),
-                    "yes_bid": yes_bid,
-                    "yes_ask": yes_ask,
-                    "spread": spread,
-                    "market_type": s.get("market_type"),
-                })
-            except Exception:
-                continue
-        if rows:
-            client.table("market_snapshots").insert(rows).execute()
+        row: dict = {
+            "trade_id": trade_id,
+            "game_id": int(game_id),
+            "market_ticker": market_ticker,
+            "side": side,
+            "total_bid_depth": int(book.get("total_bid_depth") or 0),
+            "total_ask_depth": int(book.get("total_ask_depth") or 0),
+        }
+        for i, (price, qty) in enumerate(book.get("bids") or [], start=1):
+            if i > 5:
+                break
+            row[f"bid_{i}_price"] = float(price)
+            row[f"bid_{i}_qty"] = int(qty)
+        for i, (price, qty) in enumerate(book.get("asks") or [], start=1):
+            if i > 5:
+                break
+            row[f"ask_{i}_price"] = float(price)
+            row[f"ask_{i}_qty"] = int(qty)
+        client.table("orderbook_snapshots").insert(row).execute()
     except Exception as e:
-        logger.error(f"log_market_snapshots failed (game={game_id}): {e}")
+        logger.error(
+            f"log_orderbook_snapshot failed (trade_id={trade_id} "
+            f"ticker={market_ticker}): {e}"
+        )

@@ -8,7 +8,7 @@ from app.engine import (
     compute_spread_probability,
     _runs_scored,
 )
-from backtests.mlb import PlayRecord
+from backtests.core.mlb import PlayRecord
 
 
 def enrich_with_model(records: list[PlayRecord]):

@@ -338,6 +338,57 @@ class KalshiManager:
             result.append(row)
         return result
 
+    def get_orderbook_snapshot(
+        self, ticker: str, side: str, levels: int = 5,
+    ) -> dict:
+        """Read top-N bid/ask levels from the local websocket-maintained
+        orderbook, in the trade's side-units.
+
+        Bids = resting orders you'd sell into at exit. YES trades read
+        `book.yes` directly; NO trades read `book.no`. Sorted desc.
+
+        Asks = resting orders you cross to enter. Opposite-side bids
+        flipped into traded-side units (`1 - p`). Same convention
+        `_get_ask_levels` and `has_exit_liquidity` use, so a snapshot
+        logged here matches what sizing / exit-liquidity checks saw.
+
+        Returns empty lists + zero depths when the local book hasn't
+        been populated yet (fresh subscription, pre-first-snapshot).
+        Caller decides whether to skip the write.
+        """
+        with self._lock:
+            book = self._books.get(ticker)
+        if book is None:
+            return {"bids": [], "asks": [], "total_bid_depth": 0, "total_ask_depth": 0}
+
+        same_side = book.yes if side == "YES" else book.no
+        opp_side = book.no if side == "YES" else book.yes
+
+        def _parse(d):
+            out = []
+            for p_str, q_str in d.items():
+                try:
+                    p = float(p_str)
+                    q = int(float(q_str))
+                except (TypeError, ValueError):
+                    continue
+                if q > 0:
+                    out.append((p, q))
+            return out
+
+        bid_raw = _parse(same_side)
+        ask_raw = [(round(1.0 - p, 4), q) for p, q in _parse(opp_side)]
+
+        bid_sorted = sorted(bid_raw, key=lambda x: x[0], reverse=True)
+        ask_sorted = sorted(ask_raw, key=lambda x: x[0])
+
+        return {
+            "bids": bid_sorted[:levels],
+            "asks": ask_sorted[:levels],
+            "total_bid_depth": sum(q for _, q in bid_raw),
+            "total_ask_depth": sum(q for _, q in ask_raw),
+        }
+
     def has_exit_liquidity(
         self,
         ticker: str,

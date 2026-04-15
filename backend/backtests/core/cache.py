@@ -10,8 +10,8 @@ from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 
-from backtests.mlb import PlayRecord, MarketSpec
-from backtests.output import OUTPUT_DIR
+from backtests.core.mlb import PlayRecord, MarketSpec
+from backtests.reporting.output import OUTPUT_DIR
 
 CACHE_DIR = OUTPUT_DIR / "cache"
 
@@ -32,6 +32,13 @@ def list_cached_games(target: date) -> list[int]:
         int(p.name) for p in d.iterdir()
         if p.is_dir() and p.name.isdigit() and (p / "game.json").exists()
     )
+
+
+def is_game_cached(target: date, game_id: int) -> bool:
+    """Cheap existence check — just probes for `game.json`. Used by the
+    backtest CLI to skip MLB + Kalshi pulls (and the re-save) when a game
+    is already on disk. No JSON parse, no allocation."""
+    return (_game_dir(target, game_id) / "game.json").exists()
 
 
 def _record_to_dict(rec: PlayRecord) -> dict:

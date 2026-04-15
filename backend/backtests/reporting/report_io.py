@@ -11,7 +11,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPORTS_DIR = Path(__file__).parent / "reports"
+# `reports/` lives at the backtests package root (backtests/reports/),
+# one level above this reporting/ subpackage.
+REPORTS_DIR = Path(__file__).resolve().parents[1] / "reports"
 
 
 def _ts() -> str:
