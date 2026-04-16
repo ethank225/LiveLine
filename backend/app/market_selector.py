@@ -486,6 +486,27 @@ def _empty_trade(event: str, bet_size: int) -> dict:
     }
 
 
+def _rejection(
+    market: MarketInfo,
+    reason: str,
+    detail: str,
+    side: str | None = None,
+) -> dict:
+    """Build the standard rejection dict returned by `_evaluate_market` when
+    a guard blocks a trade. `active=False` plus a `rejection_reason` keyword
+    distinguishes it from a valid candidate; callers that consume both paths
+    (compute_best_trades' decision log) match on those keys."""
+    return {
+        "active": False,
+        "rejection_reason": reason,
+        "rejection_detail": detail,
+        "market_ticker": market.ticker,
+        "market_label": market.label,
+        "market_type": market.market_type,
+        "side": side,
+    }
+
+
 def _evaluate_market(
     market: MarketInfo,
     delta_value: float,
@@ -499,8 +520,14 @@ def _evaluate_market(
     exit_slippage_cents: int = 0,
     max_dollars: float = 0.0,
     max_slippage_cents: float = 0.0,
-) -> dict | None:
-    """Evaluate a single market for one event. Returns trade info or None."""
+) -> dict:
+    """Evaluate a single market for one event.
+
+    Always returns a dict. Success dicts carry the full trade info and will
+    have `active` set by the caller based on total_ev > 0. Rejection dicts
+    carry `active=False` plus `rejection_reason` / `rejection_detail` so the
+    decision-log builder in `compute_best_trades` can explain what got
+    filtered and why."""
     prefix = f"eval[{event or '-'}][{market.label}]"
 
     # Stale-market guard: if the websocket hasn't seen a tick on this ticker
@@ -512,7 +539,10 @@ def _evaluate_market(
         logger.info(
             f"{prefix} skipped: stale ticker (no tick in {stale_market_seconds}s)"
         )
-        return None
+        return _rejection(
+            market, "stale_market",
+            f"no tick in {stale_market_seconds}s",
+        )
 
     prices = kalshi.get_prices(market.ticker)
 
@@ -616,7 +646,10 @@ def _evaluate_market(
 
     if best is None:
         logger.info(f"{prefix} → no trade")
-        return None
+        return _rejection(
+            market, "no_viable_side",
+            f"YES: {yes_reason}; NO: {no_reason}",
+        )
     # Round-trip fees eat profit on sub-threshold moves. Filter here so
     # the trade never reaches the button grid.
     move_cents = round(abs(best["sell_target"] - best["entry_price"]) * 100)
@@ -626,7 +659,11 @@ def _evaluate_market(
             f"{prefix} → below min_move {picked_label} ({best['side']}) "
             f"move={move_cents}¢ < {min_move_cents}¢"
         )
-        return None
+        return _rejection(
+            market, "min_move",
+            f"move={move_cents}¢ < {min_move_cents}¢",
+            side=best["side"],
+        )
     # Exit-liquidity guard. The stale-tick gate above answered "is this market
     # alive?"; this answers the harder question "can I actually get OUT?". If
     # the limit sell at target doesn't fill, we IOC into the bid book at
@@ -646,7 +683,12 @@ def _evaluate_market(
             f"insufficient exit liquidity (need {bet_size} contracts of bids "
             f"≥ ${best['entry_price'] - exit_slippage_cents/100:.2f})"
         )
-        return None
+        return _rejection(
+            market, "exit_liquidity",
+            f"need {bet_size} bids ≥ ${best['entry_price'] - exit_slippage_cents/100:.2f} "
+            f"within {exit_slippage_cents}¢",
+            side=best["side"],
+        )
 
     # Fee-aware net expected profit at a CONSTANT NOTIONAL of `bet_size`
     # contracts. This is a ranking signal — all candidates are compared at
@@ -703,10 +745,31 @@ def _evaluate_market(
         f"fees={entry_fee:.3f}+{exit_fee:.3f}"
     )
 
+    # Depth snapshot is decision-log enrichment only — the book read is
+    # already local (websocket-maintained), so this adds no network cost.
+    # If the local book hasn't populated yet, totals land at 0 and the
+    # decision log just prints bid_depth=0/ask_depth=0.
+    try:
+        depth = kalshi.get_orderbook_snapshot(market.ticker, best["side"], levels=5)
+        bid_depth = int(depth.get("total_bid_depth") or 0)
+        ask_depth = int(depth.get("total_ask_depth") or 0)
+    except Exception:
+        bid_depth, ask_depth = 0, 0
+
+    # d_eff is the side-adjusted delta (flipped for away-spread markets);
+    # this is the "predicted WE shift for the side we're taking", which is
+    # the meaningful number to log. model_move = |d_eff|*100 (the raw model
+    # move in cents). target_move = (sell_target - entry)*100 (the actual
+    # capture built into sell_target, which is alpha-scaled and 0.99-capped).
+    d_eff_signed = d if best["side"] == "YES" else -d
+    model_move_cents = round(abs(d_eff_signed) * 100, 1)
+    target_move_cents = round(move_cents, 1)
+
     return {
         "event": None,  # filled by caller
         "market_ticker": market.ticker,
         "market_title": market.title or market.label,
+        "market_label": market.label,
         "market_type": market.market_type,
         "side": best["side"],
         "entry_price": best["entry_price"],
@@ -721,6 +784,14 @@ def _evaluate_market(
         "entry_fee_est": round(entry_fee, 4),
         "exit_fee_est": round(exit_fee, 4),
         "net_expected_profit": round(net_expected_profit, 4),
+        # --- decision-log fields ---
+        "predicted_delta": round(d_eff_signed, 4),
+        "model_move_cents": model_move_cents,
+        "target_move_cents": target_move_cents,
+        "alpha_used": alpha,
+        "bid_depth": bid_depth,
+        "ask_depth": ask_depth,
+        "move_cents": move_cents,
     }
 
 
@@ -849,33 +920,44 @@ def compute_best_trades(
     _seen_trade_ids: dict[int, str] = {}   # probes accidental dict sharing
 
     for d in deltas:
-        # Collect every viable candidate (any side, any market) for this event.
-        # We keep them all so multi-market mode can fire the full positive-EV
-        # basket; single-market mode just picks the winner.
+        # Collect every eval result (candidate + rejection) for this event,
+        # then split. Candidates feed the sort/pick; rejections feed the
+        # decision log that /buy logs at tap time.
         candidates: list[dict] = []
+        rejections: list[dict] = []
+
+        def _ingest(result: dict | None):
+            if result is None:
+                return
+            if result.get("active") is False:
+                rejections.append(result)
+            else:
+                candidates.append(result)
 
         # --- Moneyline candidates ---
         if not (blowout_filter and is_blowout):
             for ml in ml_markets:
-                trade = _evaluate_market(ml, d.delta, alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents)
-                if trade:
-                    candidates.append(trade)
+                _ingest(_evaluate_market(ml, d.delta, alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents))
+        elif blowout_filter and is_blowout:
+            # Record the whole ML set as blowout-filtered so the decision log
+            # explains why no ML candidate showed up.
+            for ml in ml_markets:
+                rejections.append(_rejection(
+                    ml, "blowout_filter",
+                    f"|margin|={abs(margin)} ≥ {BLOWOUT_THRESHOLD}",
+                ))
 
         # --- O/U candidate ---
         if ou_market:
             ou_delta_data = d.over_under.get(str(ou_market.line))
             if ou_delta_data:
-                trade = _evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents)
-                if trade:
-                    candidates.append(trade)
+                _ingest(_evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents))
 
         # --- Spread candidates (home-side + away-side) ---
         for sp_market in sp_markets_picked:
             sp_delta_data = d.spread.get(str(sp_market.line))
             if sp_delta_data:
-                trade = _evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents)
-                if trade:
-                    candidates.append(trade)
+                _ingest(_evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents))
 
         if candidates:
             # Two sorts: the naive per-contract rule and the new total_ev
@@ -941,6 +1023,48 @@ def compute_best_trades(
                 for c in candidates
                 if c["total_ev"] > 0
             ]
+            # Rank every candidate both ways so the decision log can flag
+            # fee-adjusted picks. net_ev_rank is the "real" pick order;
+            # gross_ev_rank is what a fee-blind sort would have picked.
+            # fee_adjusted=True happens when the two disagree on #1.
+            net_rank_by_id = {id(c): i + 1 for i, c in enumerate(net_sorted)}
+            gross_rank_by_id = {id(c): i + 1 for i, c in enumerate(gross_sorted)}
+            decision_candidates = [
+                {
+                    **c,
+                    "display_label": compute_display_label(
+                        market_ticker=c["market_ticker"],
+                        side=c["side"],
+                        market_type=c["market_type"],
+                        home_abbr=home_abbr,
+                        away_abbr=away_abbr,
+                    ),
+                    "net_ev_rank": net_rank_by_id[id(c)],
+                    "gross_ev_rank": gross_rank_by_id[id(c)],
+                }
+                for c in net_sorted
+            ]
+            gross_pick_label = compute_display_label(
+                market_ticker=gross_pick["market_ticker"],
+                side=gross_pick["side"],
+                market_type=gross_pick["market_type"],
+                home_abbr=home_abbr,
+                away_abbr=away_abbr,
+            )
+            # Decision log payload — enriched candidates (sorted best-first by
+            # total_ev) plus rejections. Stashed on the cached trade dict so
+            # /buy can log the full picture at tap time without recomputing.
+            best_trade["decision_log"] = {
+                "event": d.event,
+                "alpha": alpha,
+                "picked_ticker": net_pick["market_ticker"],
+                "picked_side": net_pick["side"],
+                "fee_adjusted": fee_adjusted,
+                "gross_pick_label": gross_pick_label,
+                "gross_pick_side": gross_pick["side"],
+                "candidates": decision_candidates,
+                "rejected": rejections,
+            }
             result[d.event] = best_trade
 
             # --- DIAGNOSTIC ------------------------------------------------
@@ -968,6 +1092,16 @@ def compute_best_trades(
         else:
             empty = _empty_trade(d.event, bet_size)
             empty["all_trades"] = []
+            # Still log why nothing qualified — useful when debugging a
+            # silent event (user expects a trade, sees none).
+            empty["decision_log"] = {
+                "event": d.event,
+                "alpha": alpha,
+                "picked_ticker": None,
+                "picked_side": None,
+                "candidates": [],
+                "rejected": rejections,
+            }
             result[d.event] = empty
 
     # Update cache + freshness stamp. /buy checks the stamp to reject
@@ -978,6 +1112,137 @@ def compute_best_trades(
         _trade_cache_timestamps[game_id] = time.time()
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Decision-log formatter — called from /buy so each tap leaves a single
+# multi-line record of which candidates were seen, which were blocked, and
+# why the winner won. Not called on recompute (would flood).
+# ---------------------------------------------------------------------------
+
+
+def format_decision_log(decision: dict) -> str:
+    """Render the picker's per-event decision record as a single multi-line
+    block. Designed so `grep "DECISION <EVENT>"` returns the full block for
+    one tap without stitching together interleaved lines from neighboring
+    evaluations."""
+    event = decision.get("event", "?")
+    alpha = decision.get("alpha")
+    candidates = decision.get("candidates") or []
+    rejected = decision.get("rejected") or []
+    picked_ticker = decision.get("picked_ticker")
+    picked_side = decision.get("picked_side")
+
+    # One pick per event: `candidates[0]` is already sorted desc by total_ev
+    # (see compute_best_trades). Winner_ev is the number losing candidates
+    # are compared against in their "lower total_ev" rejection string.
+    winner_ev = candidates[0]["total_ev"] if candidates else None
+
+    def _cand_line(c: dict, is_winner: bool) -> list[str]:
+        # display_label already carries the market-type tag ("ML SEA",
+        # "SPR AZ2", "O/U 13"), so don't prefix market_type again.
+        label = c.get("display_label") or c.get("market_label") or c["market_ticker"]
+        side = c["side"]
+        head = "PICKED" if is_winner else "REJECTED"
+
+        est_qty = int(c.get("estimated_fill_qty", 0) or 0)
+        # `entry_fee_est` / `exit_fee_est` on the trade dict are at bet_size
+        # (100) notional — that's the ranking-fairness invariant consumed by
+        # Trade._recompute_expected_pnl. `total_ev` is at est_qty. Recompute
+        # fees at est_qty here so every number in this block (gross, fees,
+        # net, fee_pct) is at the same quantity as total_ev. Otherwise
+        # net_after_fees mixes two notionals and disagrees with total_ev.
+        entry_fee = taker_fee(contracts=est_qty, price_dollars=c["entry_price"]) if est_qty > 0 else 0.0
+        exit_fee = maker_fee(contracts=est_qty, price_dollars=c["sell_target"]) if est_qty > 0 else 0.0
+        total_fees = entry_fee + exit_fee
+        gross_profit = (c["sell_target"] - c["entry_price"]) * est_qty
+        net_after_fees = gross_profit - total_fees
+        fee_pct = (total_fees / gross_profit * 100) if gross_profit > 0 else 0.0
+        # Per-contract fee rate in cents.
+        entry_fee_per = (entry_fee / est_qty * 100) if est_qty > 0 else 0.0
+        exit_fee_per = (exit_fee / est_qty * 100) if est_qty > 0 else 0.0
+        # Net per-contract (same sign as total_ev) — replaces the legacy
+        # ev_per_contract display, which is `alpha*|d| - spread` and can be
+        # negative even when total_ev is positive (different model entirely).
+        net_per_contract = (net_after_fees / est_qty * 100) if est_qty > 0 else 0.0
+
+        net_rank = c.get("net_ev_rank")
+        gross_rank = c.get("gross_ev_rank")
+
+        lines = [
+            f"│ {head} → {label} {side}",
+            f"│   entry={c['entry_price']:.2f}  target={c['sell_target']:.2f}  "
+            f"move={int(c.get('move_cents', 0))}¢  alpha={alpha:.2f}",
+            f"│   predicted_delta={c.get('predicted_delta', 0):+.4f}  "
+            f"model_move={c.get('model_move_cents', 0):.1f}¢  "
+            f"target_move={c.get('target_move_cents', 0):.1f}¢",
+            f"│   est_qty={est_qty}  "
+            f"bid_depth={c.get('bid_depth', 0)}  "
+            f"ask_depth={c.get('ask_depth', 0)}  "
+            f"spread={int(round(c.get('spread', 0) * 100))}¢",
+            f"│   gross_profit=${gross_profit:.2f} "
+            f"((${c['sell_target']:.2f}-${c['entry_price']:.2f}) × {est_qty})",
+            f"│   entry_fee_est=${entry_fee:.2f} "
+            f"(taker, {entry_fee_per:.2f}¢/contract × {est_qty})",
+            f"│   exit_fee_est=${exit_fee:.2f} "
+            f"(maker, {exit_fee_per:.2f}¢/contract × {est_qty})",
+            f"│   total_fees=${total_fees:.2f}  "
+            f"fee_pct={fee_pct:.1f}% (fees/gross)",
+            f"│   net_after_fees=${net_after_fees:.2f}  "
+            f"total_ev=${c.get('total_ev', 0):.2f} (ranked by this)",
+            f"│   net/contract={net_per_contract:.2f}¢  "
+            f"gross_ev/contract (spread-adj, pre-fees)="
+            f"{c.get('ev_per_contract', 0) * 100:.1f}¢",
+            f"│   gross_ev_rank=#{gross_rank}  net_ev_rank=#{net_rank}",
+        ]
+        if not is_winner and winner_ev is not None:
+            lines.append(
+                f"│   reason: lower total_ev "
+                f"(${c.get('total_ev', 0):.2f} vs ${winner_ev:.2f})"
+            )
+        return lines
+
+    def _rej_line(r: dict) -> list[str]:
+        label = r.get("market_label") or r.get("market_ticker") or "?"
+        side = r.get("side") or "-"
+        return [
+            f"│ SKIPPED → {label} {side}",
+            f"│   reason: {r.get('rejection_reason', '?')} "
+            f"({r.get('rejection_detail', '')})",
+        ]
+
+    divider = "├" + "─" * 78
+    top = "  ┌" + "─" * 78
+    bot = "  └" + "─" * 78
+
+    body: list[str] = []
+    for i, c in enumerate(candidates):
+        is_winner = (
+            c["market_ticker"] == picked_ticker and c["side"] == picked_side
+        )
+        if body:
+            body.append(f"  {divider}")
+        body.extend(f"  {line}" for line in _cand_line(c, is_winner))
+    for r in rejected:
+        if body:
+            body.append(f"  {divider}")
+        body.extend(f"  {line}" for line in _rej_line(r))
+
+    fee_adjusted = decision.get("fee_adjusted")
+    if fee_adjusted:
+        fee_line = (
+            f"  fee_adjusted: YES — gross ranking would have picked "
+            f"{decision.get('gross_pick_label', '?')} "
+            f"{decision.get('gross_pick_side', '?')}"
+        )
+    else:
+        fee_line = "  fee_adjusted: NO (gross and net rankings agree on #1)"
+
+    header = (
+        f"[DECISION {event}] {len(candidates)} candidates evaluated, "
+        f"{len(rejected)} skipped"
+    )
+    return "\n".join([header, fee_line, top, *body, bot])
 
 
 # ---------------------------------------------------------------------------

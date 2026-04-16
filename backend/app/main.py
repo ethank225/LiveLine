@@ -29,6 +29,7 @@ from app.market_selector import (
     _pick_spread_markets_both_sides,
     compute_best_trades,
     discover_markets,
+    format_decision_log,
     get_cached_trades,
     get_cached_trades_age_s,
     notify_sse_game_state,
@@ -692,6 +693,16 @@ async def buy_event(
             detail=f"No Kalshi market found for event '{event}'.",
         )
 
+    # Decision-log dump. Fires once per /buy tap (not per SSE recompute),
+    # so grep "DECISION HR" surfaces the full candidate+rejection set that
+    # produced this specific trade.
+    decision = trade_info.get("decision_log")
+    if decision:
+        try:
+            logger.info(format_decision_log(decision))
+        except Exception as e:
+            logger.warning(f"format_decision_log failed for event={event}: {e}")
+
     # Snapshot game state for the trade row. Prefer the polling-cached copy;
     # fall back to a fresh fetch if the cache is cold (first user interaction
     # before polling has populated it).
@@ -1089,6 +1100,10 @@ async def debug_evaluate(
         prices = kalshi.get_prices(market.ticker)
         d_eff = -delta_value if market.flip else delta_value
         trade = _evaluate_market(market, delta_value, alpha, bet_size)
+        # _evaluate_market now always returns a dict; rejection dicts carry
+        # `active=False` and have no entry/target fields, so treat them as
+        # "no pick" for this debug endpoint.
+        has_pick = bool(trade) and trade.get("active") is not False
         return {
             "market": market.label,
             "ticker": market.ticker,
@@ -1105,7 +1120,7 @@ async def debug_evaluate(
                 "spread_cost": trade["spread"],
                 "ev_per_contract": trade["ev_per_contract"],
                 "estimated_profit": trade["estimated_profit"],
-            } if trade else None,
+            } if has_pick else None,
         }
 
     result = {
