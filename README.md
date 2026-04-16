@@ -216,6 +216,53 @@ With `multi_market=true`, one tap fires the entire basket of positive-EV markets
 
 `dry_run=true` is the default. Trades are priced against live Kalshi data but no real orders hit the exchange — the P&L in Supabase is what you *would* have made. Flip to `false` from the Settings page once you trust the picker.
 
+### Loss-prevention blockers
+
+Every layer has guards whose only job is to stop a losing trade. Ordered from earliest-fired (before a trade is even offered) to last-resort (once capital is already committed).
+
+**Picker filters — a bad trade never reaches the grid.**
+
+| Blocker | Why | Helpful when |
+|---|---|---|
+| **`EV > 0`** | Net expected value must be positive after the α discount and bid/ask spread. The whole ranker is built on this — non-positive EV means we're expected to lose on average. | Thin books where the spread alone eats the predicted move. |
+| **`min_move_cents` (default 3¢)** | Flat absolute floor on the entry→target distance. A sanity bound below which one contract of execution noise (a tick against us on entry) swallows the whole edge. | A 1–2¢ "edge" on a mid-priced ML contract that would be pure noise after a realistic taker fill. |
+| **`min_move_to_fee_ratio` (default 2.0×)** | Price-aware floor — target move must be ≥ N× per-contract round-trip fee. Kalshi fees scale with `p·(1−p)` (peak near 50¢), so a flat cents threshold over-filters cheap contracts and under-filters expensive ones. | An 80¢ O/U contract with a 4¢ target move — flat `min_move_cents` passes it, but fees on that price band make it a net loser. |
+| **Blowout filter** | Drops moneyline trades on games where win probability has already saturated (e.g. 97%/3%). The model's deltas are still "real" but the market barely moves in response, so realized capture collapses. | 8th inning, home team up 7 with 2 outs — the ML contracts are basically pinned at $0.97, and a model-predicted 2¢ move on a K won't actually show up. |
+| **Stale-market guard (`stale_market_seconds`, default 60s)** | Skips any ticker whose websocket hasn't seen a tick in N seconds. A dead book means our entry at ask is theoretical; the resting sell probably won't fill either. | A niche spread line (e.g. `-3.5`) that's technically listed but nobody's quoting — we'd sit filled and bleed out on the 45s clean-window IOC exit. |
+| **Exit-liquidity guard (`exit_slippage_cents`, default 5¢)** | Requires enough resting bids within N cents of entry to absorb our `bet_size` on the way out. The filter simulates the exit before committing the entry. | Thin O/U book that quotes 82¢/85¢ but with only 3 contracts at 82¢ — we can get filled on entry but the exit would slip through 75¢ and turn a winner into a loser. |
+
+**Tap-time guards — prevent the handler from firing on stale state.**
+
+| Blocker | Why | Helpful when |
+|---|---|---|
+| **Cached-trade freshness (5s)** | `/buy` rejects taps against a cached trade snapshot older than 5 seconds. The button colors what you clicked; if the book has moved since that snapshot, the entry price on record is fiction. | You tap right as a tick revises the ask up 3¢ — without this guard you'd buy at the new worse price while thinking you got the old one. |
+| **Kill-switch check** | Any `/buy` hits a 503 when the user's kill switch is armed. Flushes out a race where a tap is in flight as the session loss limit breaches. | Session just crossed −$1500, flatten-all just fired, and a tap was already on the wire — this blocks it from opening a new position post-kill. |
+
+**In-trade guards — cut losses once capital is committed.**
+
+| Blocker | Why | Helpful when |
+|---|---|---|
+| **Undo window (3s)** | After the IOC buy fills, the resting sell isn't placed for 3s. During that window the user can tap undo and the position is IOC-flattened at ~zero slippage. | Fat-fingered the wrong event button — bail inside 3s instead of eating the full spread round-trip. |
+| **Clean-window timeout (45s)** | If the resting limit sell hasn't filled in 45s, it's canceled and the position is IOC-exited at market. Stops "hoping" on a target that isn't coming. | Target price printed once and walked away — without the forced exit the position just bleeds as the edge decays. |
+| **Stop loss (10¢)** | Armed against websocket ticks. If the market moves 10¢ against the entry, the resting sell is canceled and the position is IOC-flattened. | Blowout inning-change that flips WE 15¢ in one play — cap the loss at 10¢ instead of riding it to the clean-window forced exit (which could be much worse). |
+| **Sell-placement retry (4 attempts, ~1.5s)** | If the resting-sell POST fails (transient Kalshi 5xx, network blip), retries 3× at 500ms spacing with a stable `client_order_id` before giving up and panic-IOC-flattening. Prevents a "bought but no exit order" hung position. | Kalshi HTTP briefly 502s right after your buy fills — retry lands cleanly instead of leaving an unhedged position that only the clean-window can close. |
+| **Panic IOC flatten (last resort)** | If all sell retries fail, the position is immediately IOC-sold at market rather than left naked. | Kalshi sell endpoint is fully down but tick feed still works — we eat the spread but don't hold a bag waiting for the 45s timeout. |
+
+**Session-level guards — stop the bleeding across many trades.**
+
+| Blocker | Why | Helpful when |
+|---|---|---|
+| **Session loss limit (default −$1500)** | Per-(user, game) floor. Breaching it auto-arms the kill switch. Bounds how bad a single game can get. | A game where the model is mis-calibrated and every trade loses — stops compounding after a defined cap instead of chasing losses play by play. |
+| **Per-user kill switch** | Manual or auto-armed; flattens every live position for the user and returns 503 on further `/buy` calls until reset. Idempotent. | Something's clearly wrong (a bug, a suspicious streak) and you want to halt trading instantly without closing 10 browser tabs. |
+
+**Operational guards — protect across restarts and outages.**
+
+| Blocker | Why | Helpful when |
+|---|---|---|
+| **Dry-run default** | `dry_run=true` on every new user. No real capital moves until the user explicitly flips it on the Settings page. | New deploys, new users, regression tests — no way to take real losses by accident. |
+| **Startup reconciliation** | On boot, any LiveLine-tagged resting orders from a previous run are canceled; open MLB positions are flagged for manual review. | Backend crashed with a resting sell out on Kalshi — reconciliation cancels it rather than letting an unowned-by-any-Trade order sit. |
+| **Supabase-failure tolerance** | All `database.py` helpers wrap in `try/except` and return safe defaults. Supabase outages disable logging but do not block trading or cause a misread of session state. | Supabase maintenance window — trades continue to place and exit correctly; logging catches up when it recovers. |
+
 ---
 
 ## Running the backtest
@@ -298,12 +345,10 @@ All endpoints require a Supabase Bearer JWT except `/health`. SSE passes the JWT
 
 ## Safety
 
-- **Dry-run is the default.** `dry_run=false` is an explicit, per-user decision made on the Settings page.
-- **Per-user kill switch** flattens live positions, blocks new buys, and is idempotent. Tripped automatically when `session_loss_limit` breaches.
-- **Startup reconciliation** — on boot, any LiveLine-tagged resting orders left over from a crash are canceled; open MLB positions are flagged for manual review.
-- **Cached-trade freshness guard** — `/buy` rejects taps against trade entries older than 5 seconds so you can't buy into a book that's already moved.
-- **Supabase failures are non-fatal.** Every DB helper wraps in `try/except` and returns a safe default; a Supabase outage disables logging but not trading.
+Trade-level loss-prevention guards are enumerated in [Loss-prevention blockers](#loss-prevention-blockers) above. This section covers only the availability-adjacent guarantees that aren't about stopping a losing trade:
+
 - **Auth cache is stale-while-error** — a previously-verified JWT continues to work for up to an hour during a Supabase auth outage, so active sessions don't drop.
+- **Kill-switch + freshness guards are enforced server-side.** The frontend can't bypass them by spoofing a direct `/buy` — every trade-placing path goes through `main.buy_event`, which checks both unconditionally.
 
 ---
 
