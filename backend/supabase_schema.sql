@@ -102,7 +102,8 @@ create table if not exists public.trades (
   alpha               numeric,
 
   status              text not null,           -- undo_window, open, filled, expired,
-                                               -- stopped, canceled, canceled_by_user, error
+                                               -- stopped, canceled, canceled_by_user,
+                                               -- canceled_by_kill, error, no_fill
   exit_price          numeric,
   realized_pnl        numeric,
   closed_at           timestamptz,
@@ -132,6 +133,15 @@ alter table public.trades
   add column if not exists gross_pnl  numeric,
   add column if not exists entry_fee  numeric,
   add column if not exists exit_fee   numeric;
+
+-- Contracts that actually exited the position. May differ from
+-- `quantity` on partial IOC fills (Kalshi fills against available bids
+-- only). Without this, reconciliation via (exit_price - entry_price) *
+-- quantity disagrees with `realized_pnl` whenever an IOC partially
+-- filled — which at $500/play into thin books happens on every force-
+-- exit.
+alter table public.trades
+  add column if not exists exit_qty integer;
 
 -- Picker annotations. market_selector stamps these on every trade at
 -- creation time so post-hoc analysis can reconstruct WHY the picker

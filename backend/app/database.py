@@ -308,6 +308,7 @@ def update_trade_status(
     gross_pnl: float | None = None,
     entry_fee: float | None = None,
     exit_fee: float | None = None,
+    exit_qty: int | None = None,
 ) -> None:
     logger.info(f"update_trade_status called (trade_id={trade_id} status={status})")
     client = _get_client()
@@ -332,7 +333,16 @@ def update_trade_status(
             patch["entry_fee"] = float(entry_fee)
         if exit_fee is not None:
             patch["exit_fee"] = float(exit_fee)
-        if status in ("filled", "expired", "stopped", "canceled", "canceled_by_user", "error", "no_fill"):
+        if exit_qty is not None:
+            # Contracts that actually exited. Without this, partial IOC
+            # fills left the row at quantity=N (requested) even when only
+            # M<N contracts cleared; reconciliation vs. realized_pnl then
+            # produced inconsistent per-contract P&L.
+            patch["exit_qty"] = int(exit_qty)
+        if status in (
+            "filled", "expired", "stopped", "canceled",
+            "canceled_by_user", "canceled_by_kill", "error", "no_fill",
+        ):
             patch["closed_at"] = _iso(datetime.now(timezone.utc))
         resp = client.table("trades").update(patch).eq("id", trade_id).execute()
         logger.info(f"update_trade_status: patched trade {trade_id} → {status} ({len(resp.data or [])} rows)")

@@ -29,6 +29,16 @@ export default function Settings() {
   const lastSaved = useRef({})
   const saveTimer = useRef(null)
 
+  // Kill switch local UI state. Two-tap confirm so a misthumb doesn't
+  // flatten the whole book; `armed` tracks whether the backend flag is
+  // currently set for this user (fetched on mount, mirrored on every
+  // POST /kill · POST /kill/reset).
+  const [armed, setArmed] = useState(false)
+  const [confirming, setConfirming] = useState(false)
+  const [firing, setFiring] = useState(false)
+  const [lastResult, setLastResult] = useState(null)
+  const confirmTimer = useRef(null)
+
   useEffect(() => {
     api.getSettings().then(s => {
       setSettings(s)
@@ -37,6 +47,56 @@ export default function Settings() {
       }
     }).catch(() => {})
   }, [])
+
+  // Sync the kill-switch armed state on mount so the button reflects
+  // reality (e.g. the limit tripped automatically on a prior game).
+  useEffect(() => {
+    let cancelled = false
+    api.killSwitchStatus()
+      .then(s => { if (!cancelled) setArmed(!!s?.armed) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+
+  // Cleanup for the confirm-countdown timer.
+  useEffect(() => () => {
+    if (confirmTimer.current) clearTimeout(confirmTimer.current)
+  }, [])
+
+  const handleKillTap = async () => {
+    if (firing || armed) return
+    if (!confirming) {
+      setConfirming(true)
+      if (navigator.vibrate) navigator.vibrate(30)
+      if (confirmTimer.current) clearTimeout(confirmTimer.current)
+      confirmTimer.current = setTimeout(() => setConfirming(false), 3000)
+      return
+    }
+    if (confirmTimer.current) clearTimeout(confirmTimer.current)
+    setConfirming(false)
+    setFiring(true)
+    if (navigator.vibrate) navigator.vibrate([40, 30, 40])
+    try {
+      const result = await api.killSwitch()
+      setLastResult(result || null)
+      setArmed(true)
+    } catch (e) {
+      console.error('Kill switch failed', e)
+      setLastResult({ error: String(e?.status || e?.message || e) })
+    } finally {
+      setFiring(false)
+    }
+  }
+
+  const handleKillReset = async () => {
+    try {
+      await api.killSwitchReset()
+    } catch (e) {
+      console.error('Kill reset failed', e)
+    }
+    setArmed(false)
+    setLastResult(null)
+  }
 
   // Debounced auto-save. Fires a PUT with only the keys that actually
   // changed, so racing toggles don't clobber each other.
@@ -203,6 +263,69 @@ export default function Settings() {
               }
               last
             />
+          </Section>
+
+          {/* --- Emergency ------------------------------------------------ */}
+          <Section title="Emergency">
+            <div className="px-3.5 py-3.5">
+              <div className="text-[14px] font-medium text-white leading-tight mb-0.5">
+                Kill switch
+              </div>
+              <div className="text-[11px] text-slate-500 leading-tight mb-3">
+                Cancels every open order, IOC-flattens every position, and
+                blocks new buys until reset. Tap twice to confirm.
+              </div>
+              {armed ? (
+                <button
+                  onClick={handleKillReset}
+                  className="w-full py-3 rounded-xl text-sm font-bold tracking-wider
+                             border border-rose-500/50 bg-rose-500/15 text-rose-200
+                             hover:bg-rose-500/25 active:bg-rose-500/35 transition-colors"
+                >
+                  RESET (resume trading)
+                </button>
+              ) : firing ? (
+                <button
+                  disabled
+                  className="w-full py-3 rounded-xl text-sm font-bold tracking-wider
+                             border border-rose-500 bg-rose-500/30 text-rose-100
+                             animate-pulse"
+                >
+                  KILLING…
+                </button>
+              ) : confirming ? (
+                <button
+                  onClick={handleKillTap}
+                  className="w-full py-3 rounded-xl text-sm font-black tracking-wider
+                             border border-rose-400 bg-rose-500 text-white
+                             animate-pulse active:bg-rose-600 transition-colors"
+                >
+                  TAP AGAIN TO CONFIRM
+                </button>
+              ) : (
+                <button
+                  onClick={handleKillTap}
+                  className="w-full py-3 rounded-xl text-sm font-bold tracking-wider
+                             border border-rose-500/40 bg-rose-500/10 text-rose-300
+                             hover:bg-rose-500/20 hover:border-rose-400
+                             active:bg-rose-500/30 transition-colors"
+                >
+                  KILL
+                </button>
+              )}
+              {lastResult && !lastResult.error && (
+                <div className="text-[11px] text-rose-300/80 mt-2 leading-tight">
+                  Flattened {(lastResult.flattened || []).length}
+                  {(lastResult.skipped || []).length > 0 && ` · skipped ${lastResult.skipped.length}`}
+                  {(lastResult.errors || []).length > 0 && ` · errors ${lastResult.errors.length}`}
+                </div>
+              )}
+              {lastResult?.error && (
+                <div className="text-[11px] text-amber-300 mt-2 leading-tight">
+                  Request failed: {lastResult.error}
+                </div>
+              )}
+            </div>
           </Section>
 
           {/* --- Account -------------------------------------------------- */}

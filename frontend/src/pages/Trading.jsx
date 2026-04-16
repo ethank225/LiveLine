@@ -40,6 +40,16 @@ export default function Trading() {
   const [refreshing, setRefreshing] = useState(false)
   const [flashPanel, setFlashPanel] = useState(false)
   const [authError, setAuthError] = useState(false)
+  // When the backend session_loss_limit trips, the backend arms the kill
+  // switch and pushes a `session_limit_reached` SSE event. We keep the
+  // latest payload (pnl + limit) so the banner can show numbers; any
+  // truthy value also disables buy buttons for the rest of the session.
+  const [sessionLimit, setSessionLimit] = useState(null)
+  // Manual kill switch state. The button lives on the Settings page; here
+  // we only render the "trading disabled" banner and block buy buttons
+  // whenever the backend flag is armed for this user. Populated on mount
+  // from GET /kill so navigating back from Settings picks up the state.
+  const [killed, setKilled] = useState(null)
 
   // Connection status
   const [connStatus, setConnStatus] = useState('reconnecting')
@@ -221,6 +231,21 @@ export default function Trading() {
         fetchHistory()
       })
 
+      // Session loss limit breached: backend armed the kill switch and
+      // flushed any open positions. Render a persistent banner and keep
+      // buy buttons disabled until the user starts a new game.
+      es.addEventListener('session_limit_reached', (e) => {
+        try {
+          const data = JSON.parse(e.data)
+          setSessionLimit({
+            pnl: data.pnl,
+            limit: data.limit,
+          })
+        } catch {
+          setSessionLimit({ pnl: null, limit: null })
+        }
+      })
+
       es.onerror = () => {
         es.close()
         sseRetries.current += 1
@@ -302,6 +327,43 @@ export default function Trading() {
     setUndoQueue(prev => prev.filter(e => e.position_id !== positionId))
     fetchPositions()
   }, [fetchPositions])
+
+  // Instant-sell on a resting-open position. Calls POST /cancel which
+  // (for status=open) cancels the resting limit sell, IOC-flattens at
+  // the bid, and returns the realized P&L. The SSE positions_update
+  // push that follows swaps the card for its terminal row, so we just
+  // refresh the lists defensively here in case SSE is flaky.
+  const handleInstantSell = useCallback(async (positionId) => {
+    try {
+      await api.cancel(positionId)
+    } catch (e) {
+      console.error('Instant sell failed', e)
+    }
+    fetchPositions()
+    fetchHistory()
+  }, [fetchPositions, fetchHistory])
+
+  // User tapped RESET on the banner. Backend disarms the flag; UI clears
+  // the banner. Flattened positions stay flattened (not re-opened).
+  const handleKillReset = useCallback(async () => {
+    try {
+      await api.killSwitchReset()
+    } catch (e) {
+      console.error('Kill reset failed', e)
+    }
+    setKilled(null)
+  }, [])
+
+  // On mount / gameId change, sync kill-switch state from the backend.
+  // If the user armed from Settings and then navigated here, the banner
+  // should appear without needing a page reload.
+  useEffect(() => {
+    let cancelled = false
+    api.killSwitchStatus()
+      .then(s => { if (!cancelled && s?.armed) setKilled({ armed: true }) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [gameId])
 
   // ---------------------------------------------------------------------------
   // Derived display values
@@ -456,12 +518,51 @@ export default function Trading() {
         </div>
       )}
 
+      {/* Session loss limit tripped — backend has disabled trading. */}
+      {sessionLimit && (
+        <div className="mx-4 mb-2 rounded-md border border-rose-500/50 bg-rose-500/10 px-3 py-2 text-[12px] text-rose-200 flex items-center gap-2">
+          <span className="w-1.5 h-1.5 rounded-full bg-rose-400 animate-pulse" />
+          <span>
+            Session loss limit reached
+            {sessionLimit.pnl != null && sessionLimit.limit != null && (
+              <span className="text-rose-300/70">
+                {' '}· ${Number(sessionLimit.pnl).toFixed(2)} ≤ ${Number(sessionLimit.limit).toFixed(2)}
+              </span>
+            )}
+            <span className="text-rose-300/70"> · trading disabled</span>
+          </span>
+        </div>
+      )}
+
+      {/* Kill switch armed — banner stays up until the user resets from
+          here or from Settings. Flatten counts only appear when the fire
+          happened in this tab (direct POST response); a kill from another
+          tab or from Settings renders the banner without the count. */}
+      {killed && (
+        <div className="mx-4 mb-2 rounded-md border border-rose-500/60 bg-rose-500/15 px-3 py-2 text-[12px] text-rose-100 flex items-center gap-3">
+          <span className="w-1.5 h-1.5 rounded-full bg-rose-400 animate-pulse" />
+          <span className="flex-1">
+            Kill switch armed
+            {Array.isArray(killed.flattened) && (
+              <span className="text-rose-300/80"> · flattened {killed.flattened.length}</span>
+            )}
+            <span className="text-rose-300/80"> · trading disabled</span>
+          </span>
+          <button
+            onClick={handleKillReset}
+            className="text-[11px] font-bold tracking-wider px-2 py-0.5 rounded border border-rose-400/50 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20 transition-colors"
+          >
+            RESET
+          </button>
+        </div>
+      )}
+
       {/* Event buttons — isolated from parent re-renders */}
       <div className="px-4 pb-2">
         <div className="text-xs text-slate-500 mb-2 font-medium">Tap when you see it</div>
         <ButtonGrid
           gameId={gameId}
-          disabled={notStarted}
+          disabled={notStarted || !!sessionLimit || !!killed}
           onBuy={handleBuy}
         />
       </div>
@@ -492,8 +593,8 @@ export default function Trading() {
               .map(g => {
                 const key = g[0].undo_group_id || g[0].id || g[0].position_id
                 return g.length > 1
-                  ? <GroupedPositionCard key={key} positions={g} />
-                  : <PositionCard key={key} position={g[0]} />
+                  ? <GroupedPositionCard key={key} positions={g} onInstantSell={handleInstantSell} />
+                  : <PositionCard key={key} position={g[0]} onInstantSell={handleInstantSell} />
               })}
           </>
         )}

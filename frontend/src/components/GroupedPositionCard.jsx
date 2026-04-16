@@ -1,4 +1,4 @@
-import { memo } from 'react'
+import { memo, useState } from 'react'
 import { betLabel } from '../utils/betLabel'
 import { formatClock, useTradeCountdown } from '../utils/time'
 import { TradeTimer } from './TradeTimer'
@@ -52,7 +52,7 @@ function subFields(p) {
 // footer is plain (no inner background), just a baseline-aligned row.
 // ---------------------------------------------------------------------------
 
-function GroupedPositionCard({ positions }) {
+function GroupedPositionCard({ positions, onInstantSell }) {
   if (!positions?.length) return null
   // A length-1 basket shouldn't reach this component anymore (PositionCard
   // handles singles directly), but render defensively just in case.
@@ -99,7 +99,11 @@ function GroupedPositionCard({ positions }) {
       {/* Sub-positions */}
       <div className="space-y-1">
         {positions.map((p) => (
-          <SubRow key={p.id || p.position_id} position={p} />
+          <SubRow
+            key={p.id || p.position_id}
+            position={p}
+            onInstantSell={onInstantSell}
+          />
         ))}
       </div>
 
@@ -146,10 +150,21 @@ export default memo(GroupedPositionCard, (prev, next) => {
 //   ┃ 45¢ → 57¢                         +$4.80
 // ---------------------------------------------------------------------------
 
-function SubRowInner({ position }) {
+function SubRowInner({ position, onInstantSell }) {
   const status = position.status || 'open'
   const isOpen = status === 'open' || status === 'undo_window'
   const isTerminal = TERMINAL.has(status)
+  const [selling, setSelling] = useState(false)
+
+  const handleInstantSell = async () => {
+    if (selling || !onInstantSell) return
+    setSelling(true)
+    try {
+      await onInstantSell(position.position_id || position.id)
+    } finally {
+      setSelling(false)
+    }
+  }
 
   const { isPending, remaining } = useTradeCountdown(
     isOpen ? position.created_at : null,
@@ -208,6 +223,23 @@ function SubRowInner({ position }) {
         </span>
         {valueEl}
       </div>
+      {/* Per-leg instant-sell: only a resting-open leg shows it. Other
+          legs in the basket may already be filled / expired and stay
+          as-is. */}
+      {status === 'open' && onInstantSell && (
+        <button
+          onClick={handleInstantSell}
+          disabled={selling}
+          className={`mt-1.5 w-full py-1 rounded text-[11px] font-bold tracking-wider
+                      border transition-colors
+                      ${selling
+                        ? 'border-rose-500 bg-rose-500/30 text-rose-100 animate-pulse cursor-wait'
+                        : 'border-rose-500/50 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20 hover:border-rose-400 active:bg-rose-500/30'
+                      }`}
+        >
+          {selling ? 'SELLING…' : 'INSTANT SELL'}
+        </button>
+      )}
     </div>
   )
 }

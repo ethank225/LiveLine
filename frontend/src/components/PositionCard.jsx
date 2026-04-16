@@ -1,4 +1,4 @@
-import { memo } from 'react'
+import { memo, useState } from 'react'
 import { betLabel } from '../utils/betLabel'
 import { formatClock, useTradeCountdown } from '../utils/time'
 
@@ -44,10 +44,24 @@ function formatPnl(x) {
 // and value bottom. Thin 2px progress bar under the prices while active.
 // ---------------------------------------------------------------------------
 
-function PositionCard({ position }) {
+function PositionCard({ position, onInstantSell }) {
   const status = position.status || 'open'
   const isOpen = status === 'open' || status === 'undo_window'
   const isTerminal = TERMINAL.has(status)
+  const [selling, setSelling] = useState(false)
+
+  const handleInstantSell = async () => {
+    if (selling || !onInstantSell) return
+    setSelling(true)
+    try {
+      await onInstantSell(position.position_id || position.id)
+    } finally {
+      // Leave selling=true if the request succeeded — the SSE
+      // positions_update will swap this card for the terminal row.
+      // On error, clear so the user can retry.
+      setSelling(false)
+    }
+  }
 
   // Clean-window awareness — flips the whole card (border + label + bar)
   // to amber when the force-exit timer is about to fire.
@@ -134,6 +148,25 @@ function PositionCard({ position }) {
             style={{ width: isPending ? '100%' : `${pct}%` }}
           />
         </div>
+      )}
+
+      {/* Instant-sell: resting-open only. Distinct from the 3s undo
+          overlay (which handles undo_window); this button flattens a
+          position that's already live on the book. No confirm dialog
+          per spec — one tap is intentional. */}
+      {status === 'open' && onInstantSell && (
+        <button
+          onClick={handleInstantSell}
+          disabled={selling}
+          className={`mt-2 w-full py-1.5 rounded-md text-xs font-bold tracking-wider
+                      border transition-colors
+                      ${selling
+                        ? 'border-rose-500 bg-rose-500/30 text-rose-100 animate-pulse cursor-wait'
+                        : 'border-rose-500/50 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20 hover:border-rose-400 active:bg-rose-500/30'
+                      }`}
+        >
+          {selling ? 'SELLING…' : 'INSTANT SELL'}
+        </button>
       )}
     </div>
   )

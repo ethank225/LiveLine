@@ -43,7 +43,10 @@ from app.pnl import compute_net
 
 logger = logging.getLogger(__name__)
 
-_TERMINAL_STATUSES = {"filled", "stopped", "expired", "canceled", "canceled_by_user", "error", "no_fill"}
+_TERMINAL_STATUSES = {
+    "filled", "stopped", "expired", "canceled",
+    "canceled_by_user", "canceled_by_kill", "error", "no_fill",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +283,34 @@ _registry_lock = threading.Lock()
 _active_tickers: set[str] = set()
 _active_tickers_lock = threading.Lock()
 
+# Per-user kill switch. When a user_id is in this set, Trade.execute()
+# short-circuits with KillSwitchArmedError so /buy returns 503 instead of
+# placing new orders. Cleared on fresh Session creation (new game) or by
+# an explicit /kill/reset call. The flag lives here (not in kalshi_client)
+# because it's a trading-side concept — kalshi_client just places orders.
+_killed_users: set[str] = set()
+_kill_lock = threading.Lock()
+
+
+class KillSwitchArmedError(RuntimeError):
+    """Raised by Trade.execute when the user's kill switch is armed.
+    Caught at the /buy endpoint to produce a clean 503 response."""
+
+
+def is_kill_switch_armed(user_id: str) -> bool:
+    with _kill_lock:
+        return user_id in _killed_users
+
+
+def _arm_kill_switch(user_id: str) -> None:
+    with _kill_lock:
+        _killed_users.add(user_id)
+
+
+def disarm_kill_switch(user_id: str) -> None:
+    with _kill_lock:
+        _killed_users.discard(user_id)
+
 
 # ---------------------------------------------------------------------------
 # Cross-market snapshot helper
@@ -438,6 +469,10 @@ class Session:
         self.realized_pnl = 0.0
         self.wins = 0
         self.resolved = 0
+        # Session-loss-limit SSE event fires once; flipped True on first
+        # emission so repeated /buy taps while the limit is tripped don't
+        # spam the frontend with banner refreshes.
+        self._limit_emitted = False
         # Wall-clock for the [SESSION ...] CLOSED summary's duration field.
         self.created_at: datetime = datetime.utcnow()
         self._lock = threading.Lock()
@@ -449,7 +484,10 @@ class Session:
 
     def on_trade_resolved(self, trade: "Trade") -> None:
         """Called from a Trade's terminal-state transition. Aggregates the
-        whole group's P&L once every member is terminal."""
+        whole group's P&L once every member is terminal, and proactively
+        trips the session loss limit if the new total crossed the floor."""
+        limit_tripped = False
+        loss_limit = 0.0
         with self._lock:
             group = self.groups.get(trade.undo_group_id)
             if not group:
@@ -466,6 +504,32 @@ class Session:
             self.resolved += 1
             if group_pnl > 0:
                 self.wins += 1
+            loss_limit = self.settings.get("session_loss_limit", 0.0)
+            if (
+                bool(loss_limit)
+                and loss_limit < 0
+                and self.realized_pnl <= loss_limit
+                and not self._limit_emitted
+            ):
+                self._limit_emitted = True
+                limit_tripped = True
+        # Outside the lock: arm kill + push SSE so the banner shows up
+        # the moment a losing trade pushes us over, not on the next tap.
+        if limit_tripped:
+            logger.warning(
+                f"SESSION LOSS LIMIT tripped on resolve user={self.user_id} "
+                f"game={self.game_id} pnl={self.realized_pnl:.2f} "
+                f"limit={loss_limit:.2f}"
+            )
+            _arm_kill_switch(self.user_id)
+            try:
+                from app.market_selector import notify_sse_session_limit
+                notify_sse_session_limit(
+                    self.game_id, self.user_id,
+                    pnl=self.realized_pnl, limit=loss_limit,
+                )
+            except Exception as e:
+                logger.error(f"session limit SSE push failed: {e}")
 
     def active_trades(self) -> list["Trade"]:
         return [
@@ -566,6 +630,11 @@ class Trade:
         self.entry_fee: float = 0.0
         self.exit_fee: float = 0.0
         self.exit_price: float | None = None
+        # Contracts that actually left the position at exit. On a full
+        # target fill this equals self.quantity; on a partial IOC it's
+        # the Kalshi-reported filled qty. Recorded in the DB so post-hoc
+        # reconciliation of (exit − entry) × exit_qty matches realized_pnl.
+        self.exit_qty: int | None = None
         self.completed_at: datetime | None = None
         self.created_at: datetime = datetime.utcnow()
         self.trade_db_id: str | None = None          # Supabase row pk
@@ -684,6 +753,60 @@ class Trade:
         NOT raise — it sets status="canceled" and returns.
         """
         # Already registered in _trade_index by __init__.
+
+        # Kill switch: a tripped user bails out before any order is placed.
+        # Caller (/buy) turns this into a clean 503 instead of an HTTP 500.
+        if is_kill_switch_armed(self.user_id):
+            with self._lock:
+                self.status = "canceled"
+            self._log_to_db()
+            self._notify_resolved()
+            raise KillSwitchArmedError(
+                f"Kill switch armed for user {self.user_id} — trading disabled"
+            )
+
+        # Session loss limit: once realized P&L has dropped to the floor,
+        # trip the kill switch for this user so no further trades fire
+        # and any still-open positions are flattened. Arms on first
+        # breach; subsequent /buy taps hit the kill-switch check above
+        # for 503. Status is canceled BEFORE arm_kill_switch so the
+        # module-level force-kill sweep treats this Trade as already
+        # terminal (no double-resolution).
+        session = (
+            _sessions.get((self.user_id, self.game_id)) if self.user_id else None
+        )
+        if session is not None:
+            loss_limit = session.settings.get("session_loss_limit", 0.0)
+            if loss_limit and loss_limit < 0 and session.realized_pnl <= loss_limit:
+                logger.warning(
+                    f"SESSION LOSS LIMIT user={self.user_id} game={self.game_id} "
+                    f"pnl={session.realized_pnl:.2f} limit={loss_limit:.2f} "
+                    "— arming kill switch"
+                )
+                with self._lock:
+                    self.status = "canceled"
+                # Fire the banner event exactly once per session.
+                should_emit = False
+                with session._lock:
+                    if not session._limit_emitted:
+                        session._limit_emitted = True
+                        should_emit = True
+                if should_emit:
+                    try:
+                        from app.market_selector import notify_sse_session_limit
+                        notify_sse_session_limit(
+                            session.game_id, self.user_id,
+                            pnl=session.realized_pnl, limit=loss_limit,
+                        )
+                    except Exception as e:
+                        logger.error(f"session limit SSE push failed: {e}")
+                arm_kill_switch(self.user_id)
+                self._log_to_db()
+                self._notify_resolved()
+                raise KillSwitchArmedError(
+                    f"Session loss limit reached "
+                    f"(pnl=${session.realized_pnl:.2f} ≤ ${loss_limit:.2f})"
+                )
 
         # Dedupe: if this ticker is already in-flight, bail out before
         # placing any order. Released in _notify_resolved on terminal
@@ -926,13 +1049,33 @@ class Trade:
         except Exception as e:
             logger.error(
                 f"{self._log_prefix} SELL placement FAILED: {e} — "
-                f"buy filled qty={self.quantity} but sell did not rest; verifying position"
+                f"buy filled qty={self.quantity} but sell did not rest; force-flattening"
             )
             with self._lock:
                 self.status = "error"
-            self._update_db_status("error")
+
+            # Buy filled but sell never rested: we hold a naked long with no
+            # timer, no stop, no exit path. Force-flatten at market so the
+            # position doesn't sit until next startup orphan cleanup.
+            exit_price, exit_qty = self._ioc_exit(
+                reason="sell_placement_failed", dry_run=dry_run,
+            )
+            with self._lock:
+                self._finalize_pnl(
+                    exit_price=exit_price, qty=exit_qty, exit_role="taker",
+                )
+                self.exit_price = exit_price
+                self.exit_qty = exit_qty
+                self.completed_at = datetime.utcnow()
+
+            logger.info(
+                f"{self._log_prefix} RESOLVED error (sell_placement_failed) "
+                f"pnl={_fmt_pnl(self.realized_pnl)} "
+                f"(gross={_fmt_pnl(self.gross_pnl)} fees=${self.entry_fee + self.exit_fee:.2f})"
+            )
+            self._update_db_status("error", exit_price, self.realized_pnl)
             self._notify_resolved()
-            # Orphan risk: buy filled, sell failed. Confirm against Kalshi.
+            # Last line of defense in case the IOC flatten also failed.
             self._verify_position_closed(reason="sell placement failed")
             return
 
@@ -970,12 +1113,13 @@ class Trade:
         # Sell cancel already attempted by _sell_already_filled() (dry_run
         # skips it entirely). No need to cancel again here.
 
-        exit_price = self._ioc_exit(reason="expired", dry_run=dry_run)
+        exit_price, exit_qty = self._ioc_exit(reason="expired", dry_run=dry_run)
         with self._lock:
             self._finalize_pnl(
-                exit_price=exit_price, qty=self.quantity, exit_role="taker",
+                exit_price=exit_price, qty=exit_qty, exit_role="taker",
             )
             self.exit_price = exit_price
+            self.exit_qty = exit_qty
             self.completed_at = datetime.utcnow()
 
         logger.info(
@@ -987,33 +1131,69 @@ class Trade:
         self._verify_position_closed(reason="expired")
 
     def cancel(self) -> dict | None:
-        """User tapped undo during the undo window. IOC-exit held quantity.
+        """User-initiated exit. Two entry points:
 
-        Raises ValueError if called outside the undo_window state — the
-        historical contract. TradeGroup.cancel() swallows this so members
-        that already activated don't abort the whole undo.
+          - undo_window: classic 3-second post-buy undo. No resting sell
+            yet, so we just IOC the held qty.
+          - open: "instant sell" tapped on an already-resting position.
+            Cancel the clean-window timer, cancel the resting limit sell
+            (so IOC doesn't race the book), then IOC-flatten at market.
+
+        Any other status (terminal, pending, error, no_fill) raises
+        ValueError — TradeGroup.cancel() swallows this so groups with a
+        mix of open and already-resolved legs still close what they can.
         """
         with self._lock:
-            if self.status != "undo_window":
+            if self.status == "undo_window":
+                origin = "undo_window"
+            elif self.status == "open":
+                origin = "open"
+            else:
                 raise ValueError(
-                    f"Position {self.id} is '{self.status}' — can only cancel during undo window"
+                    f"Position {self.id} is '{self.status}' — can only cancel "
+                    "from undo_window or open"
                 )
             self.status = "canceled_by_user"
-        logger.info(f"{self._log_prefix} UNDO user tapped cancel (qty={self.quantity})")
+        logger.info(
+            f"{self._log_prefix} USER-CANCEL from {origin} (qty={self.quantity})"
+        )
 
+        # Stop any timers that could race the exit path — undo timer for
+        # basket-undo taps, clean-window timer for instant-sell on open.
         if self._undo_timer:
             self._undo_timer.cancel()
+        if self._clean_timer:
+            self._clean_timer.cancel()
 
         dry_run = bool(self._settings.get("dry_run", True))
+
+        # Open-state cancel means we've already placed a resting limit
+        # sell. Cancel it before the IOC so we don't end up with two sells
+        # in flight (the IOC + a stale limit that could fill on a bounce).
+        # A 404 / already-filled is fine — reconciled via the IOC response
+        # plus _verify_position_closed at the end.
+        if origin == "open" and self.sell_order_id and not dry_run:
+            try:
+                kalshi.cancel_order(self.sell_order_id)
+            except Exception as e:
+                logger.warning(
+                    f"{self._log_prefix} USER-CANCEL sell cancel failed: {e} "
+                    "(may already be filled; continuing with IOC)"
+                )
+
         exit_price = 0.0
+        exit_qty = 0
         if self.quantity > 0:
-            exit_price = self._ioc_exit(reason="canceled_by_user", dry_run=dry_run)
+            exit_price, exit_qty = self._ioc_exit(
+                reason="canceled_by_user", dry_run=dry_run,
+            )
 
         with self._lock:
             self._finalize_pnl(
-                exit_price=exit_price, qty=self.quantity, exit_role="taker",
+                exit_price=exit_price, qty=exit_qty, exit_role="taker",
             )
             self.exit_price = exit_price
+            self.exit_qty = exit_qty
             self.completed_at = datetime.utcnow()
 
         logger.info(
@@ -1031,6 +1211,70 @@ class Trade:
             "realized_pnl": self.realized_pnl,
             "undo_group_id": self.undo_group_id,
         }
+
+    def force_kill(self, *, reason: str = "kill_switch") -> bool:
+        """Force-close this trade from any non-terminal state.
+
+        Cancels pending undo / clean-window timers, cancels the resting
+        sell if one exists, IOC-exits any held qty at market. Returns True
+        if the trade was actually flattened, False if it was already
+        terminal. Safe to call from any thread — uses the same CAS +
+        resolution plumbing every other exit path uses so double-calls are
+        no-ops rather than double-fills.
+        """
+        with self._lock:
+            if self.status in _TERMINAL_STATUSES:
+                return False
+            # Stop any pending timer from firing alongside the kill.
+            if self._undo_timer:
+                self._undo_timer.cancel()
+            if self._clean_timer:
+                self._clean_timer.cancel()
+            self.status = "canceled_by_kill"
+
+        logger.warning(
+            f"{self._log_prefix} KILL {self._short} qty={self.quantity} "
+            f"reason={reason}"
+        )
+
+        dry_run = bool(self._settings.get("dry_run", True))
+
+        # Cancel the resting limit sell so the IOC doesn't race it on the
+        # book. Dry-run has no real order to cancel. A 404/already-filled
+        # is fine — we'll reconcile via the IOC's own response.
+        if self.sell_order_id and not dry_run:
+            try:
+                kalshi.cancel_order(self.sell_order_id)
+            except Exception as e:
+                logger.warning(
+                    f"{self._log_prefix} KILL sell cancel failed: {e} "
+                    "(may already be filled; continuing with IOC)"
+                )
+
+        exit_price = 0.0
+        exit_qty = 0
+        if self.quantity > 0:
+            exit_price, exit_qty = self._ioc_exit(reason=reason, dry_run=dry_run)
+
+        with self._lock:
+            self._finalize_pnl(
+                exit_price=exit_price, qty=exit_qty, exit_role="taker",
+            )
+            self.exit_price = exit_price
+            self.exit_qty = exit_qty
+            self.completed_at = datetime.utcnow()
+
+        logger.info(
+            f"{self._log_prefix} RESOLVED canceled_by_kill "
+            f"pnl={_fmt_pnl(self.realized_pnl)} "
+            f"(gross={_fmt_pnl(self.gross_pnl)} fees=${self.entry_fee + self.exit_fee:.2f})"
+        )
+        self._update_db_status(
+            "canceled_by_kill", exit_price, self.realized_pnl,
+        )
+        self._notify_resolved()
+        self._verify_position_closed(reason=reason)
+        return True
 
     def on_price_tick(self, bid: float):
         """Called on every Kalshi tick for this ticker.
@@ -1124,13 +1368,16 @@ class Trade:
 
         # Trigger bid is just an estimate; use the real IOC fill price
         # instead so P&L reflects what actually executed on Kalshi.
-        actual_exit = self._ioc_exit(reason="stopped", dry_run=dry_run, fallback_price=exit_price)
+        actual_exit, exit_qty = self._ioc_exit(
+            reason="stopped", dry_run=dry_run, fallback_price=exit_price,
+        )
 
         with self._lock:
             self._finalize_pnl(
-                exit_price=actual_exit, qty=self.quantity, exit_role="taker",
+                exit_price=actual_exit, qty=exit_qty, exit_role="taker",
             )
             self.exit_price = actual_exit
+            self.exit_qty = exit_qty
             self.completed_at = datetime.utcnow()
 
         logger.info(
@@ -1194,9 +1441,9 @@ class Trade:
         reason: str,
         dry_run: bool,
         fallback_price: float | None = None,
-    ) -> float:
-        """Place the $0.01 IOC force-exit sell and return the per-contract
-        exit price that actually executed on Kalshi.
+    ) -> tuple[float, int]:
+        """Place the $0.01 IOC force-exit sell. Returns (per_contract_price,
+        filled_qty) — both must reflect what Kalshi actually executed.
 
         Kalshi fills IOC sells at whatever bid was available (not the
         $0.01 limit), so the real exit price comes from the POST response:
@@ -1204,9 +1451,17 @@ class Trade:
         use — using the $0.01 limit would over-report losses by the
         entire bid value.
 
+        The filled_qty is surfaced here (second element of the tuple) so
+        partial IOC fills produce a truthful DB row: quantity=requested,
+        exit_qty=actually-filled. Without this, reconciling (exit-entry) *
+        qty against realized_pnl disagrees whenever IOC didn't fully fill.
+
         If the IOC doesn't fill at all (no bids at ≥$0.01 — rare), we
         fall back to `fallback_price` if provided, otherwise the current
-        bid on the trade's side. Dry-run always uses the current bid."""
+        bid on the trade's side. In that case filled_qty is reported as
+        self.quantity because P&L is booked on the requested size at the
+        fallback price (conservative; a real 0-fill is a rare pathology).
+        Dry-run always uses the current bid and filled_qty=self.quantity."""
         limit_price = 0.01
         try:
             response = _place_order(
@@ -1221,7 +1476,7 @@ class Trade:
             )
         except Exception as e:
             logger.error(f"{self._log_prefix} EXIT IOC sell failed: {e}")
-            return self._fallback_exit_price(fallback_price)
+            return self._fallback_exit_price(fallback_price), self.quantity
 
         if dry_run:
             # Sim doesn't report real fills — approximate with current bid.
@@ -1230,7 +1485,7 @@ class Trade:
                 f"{self._log_prefix} EXIT IOC sell {self.quantity} → "
                 f"filled @${exit_price:.2f} [sim] (limit was ${limit_price:.2f})"
             )
-            return exit_price
+            return exit_price, self.quantity
 
         fill = _actual_fill(response, action="sell", side=self.side)
         if fill is None:
@@ -1241,7 +1496,7 @@ class Trade:
                 f"{self._log_prefix} EXIT IOC sell {self.quantity} → 0 fills "
                 f"(limit was ${limit_price:.2f}); using fallback ${exit_price:.2f}"
             )
-            return exit_price
+            return exit_price, self.quantity
 
         per_contract, filled_qty = fill
         tag = "filled" if filled_qty == self.quantity else f"partial {filled_qty}/{self.quantity}"
@@ -1249,7 +1504,7 @@ class Trade:
             f"{self._log_prefix} EXIT IOC sell {self.quantity} → "
             f"{tag} @${per_contract:.2f} (limit was ${limit_price:.2f})"
         )
-        return per_contract
+        return per_contract, filled_qty
 
     def _fallback_exit_price(self, fallback_price: float | None) -> float:
         """Used when an IOC exit returns no fill data (sim, zero-fill,
@@ -1346,6 +1601,7 @@ class Trade:
             # Limit sell at target → maker fee on the exit leg.
             self._finalize_pnl(exit_price=exit_price, qty=qty, exit_role="maker")
             self.exit_price = exit_price
+            self.exit_qty = qty
             self.completed_at = datetime.utcnow()
         # Lock released — safe to do side-effects that may take other locks.
         if self._clean_timer:
@@ -1535,6 +1791,10 @@ class Trade:
                 gross_pnl=self.gross_pnl if self.completed_at else None,
                 entry_fee=self.entry_fee if self.completed_at else None,
                 exit_fee=self.exit_fee if self.completed_at else None,
+                # self.exit_qty is set on every terminal path that
+                # actually closed contracts; None for transitions like
+                # "open" or "canceled" (buy didn't fill).
+                exit_qty=self.exit_qty if self.completed_at else None,
             )
         except Exception as e:
             logger.error(f"Trade._update_db_status: {e}")
@@ -1688,6 +1948,10 @@ def get_or_create_session(
         if cached is not None:
             return cached
         _sessions[key] = session
+    # Fresh session = fresh slate. If the user armed the kill switch on a
+    # previous game, starting a new one clears it so they can trade again
+    # without a separate /kill/reset call.
+    disarm_kill_switch(user_id)
     return session
 
 
@@ -1697,6 +1961,7 @@ _SETTINGS_WHITELIST = frozenset({
     "alpha", "bet_size", "max_dollars", "max_slippage_cents",
     "use_undo_window", "use_stop_loss", "stop_loss_cents",
     "dry_run", "blowout_filter", "multi_market", "min_move_cents",
+    "session_loss_limit",
 })
 
 
@@ -1840,6 +2105,52 @@ def _find_trade(trade_id: str) -> Trade | None:
 find_trade = _find_trade
 
 
+def arm_kill_switch(user_id: str) -> dict:
+    """Arm the per-user kill switch and flatten everything this user owns.
+
+    Effects:
+      1. Sets the user's kill flag so new Trade.execute() calls 503.
+      2. Walks _trade_index for every non-terminal trade owned by user_id
+         and calls force_kill() on each (cancels timers, cancels resting
+         sell, IOC-flattens held qty).
+      3. Returns a summary dict for the /kill HTTP response.
+
+    Safe to call repeatedly — already-terminal trades are skipped.
+    """
+    _arm_kill_switch(user_id)
+
+    with _registry_lock:
+        victims = [
+            t for t in _trade_index.values()
+            if t.user_id == user_id and t.status not in _TERMINAL_STATUSES
+        ]
+
+    flattened: list[str] = []
+    skipped: list[str] = []
+    errors: list[dict] = []
+    for t in victims:
+        try:
+            if t.force_kill(reason="kill_switch"):
+                flattened.append(t.id)
+            else:
+                skipped.append(t.id)
+        except Exception as e:
+            logger.error(f"arm_kill_switch: force_kill({t.id}) failed: {e}")
+            errors.append({"trade_id": t.id, "error": str(e)})
+
+    logger.warning(
+        f"KILL SWITCH user={user_id} flattened={len(flattened)} "
+        f"skipped={len(skipped)} errors={len(errors)}"
+    )
+
+    return {
+        "armed": True,
+        "flattened": flattened,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
 def execute_trade(
     game_id: int,
     event: str,
@@ -1878,7 +2189,14 @@ def execute_trade(
 
 def cancel_position(position_id: str) -> dict:
     """Cancel by trade id. O(1): trade → session → group.
-    Raises ValueError if the single trade isn't in its undo window."""
+
+    Handles both the 3s undo window and the "instant sell" on an
+    already-resting open position. Raises ValueError if the trade is in
+    any other state (already terminal, pending, error, no_fill).
+
+    For a multi-market basket the cancel fans out to every leg; legs in
+    unsupported states are skipped rather than aborting the whole group.
+    """
     trade = _find_trade(position_id)
     if trade is None:
         raise ValueError(f"Position {position_id} not found")
@@ -1895,7 +2213,7 @@ def cancel_position(position_id: str) -> dict:
         if not results:
             raise ValueError(
                 f"No positions in group {trade.undo_group_id} were cancelable "
-                "(all already past the undo window)"
+                "(none in undo_window or open)"
             )
         total_pnl = round(sum(r["realized_pnl"] for r in results), 2)
         return {
@@ -1906,7 +2224,8 @@ def cancel_position(position_id: str) -> dict:
             "count": len(results),
         }
 
-    # Single-trade path (raises ValueError if past undo window).
+    # Single-trade path (raises ValueError if trade is in a state that
+    # can't be canceled).
     return trade.cancel()
 
 

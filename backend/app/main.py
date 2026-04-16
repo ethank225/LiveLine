@@ -20,6 +20,7 @@ from app.engine import GameState, compute_deltas, get_win_expectancy, ALL_OU_LIN
 from app.game_state import get_game_state, get_todays_games, mlb_today
 from app.kalshi_client import kalshi
 from app.market_selector import (
+    CACHED_TRADE_MAX_AGE_S,
     DEFAULT_SETTINGS,
     _evaluate_market,
     _notify_sse,
@@ -29,6 +30,7 @@ from app.market_selector import (
     compute_best_trades,
     discover_markets,
     get_cached_trades,
+    get_cached_trades_age_s,
     notify_sse_game_state,
     on_price_update,
     set_event_loop,
@@ -40,16 +42,20 @@ from app.market_selector import (
 )
 from app import trader
 from app.trader import (
+    KillSwitchArmedError,
     Trade,
     TradeGroup,
+    arm_kill_switch,
     cancel_position,
     check_stop_losses,
+    disarm_kill_switch,
     dispatch_websocket_fill,
     cleanup_orphaned_liveline_orders,
     execute_trade,
     find_trade,
     get_pnl,
     get_positions,
+    is_kill_switch_armed,
 )
 
 logging.basicConfig(
@@ -632,6 +638,15 @@ async def buy_event(
     if not kalshi.is_connected:
         raise HTTPException(status_code=503, detail="Kalshi not connected")
 
+    # Kill switch check precedes everything else. A tripped user should
+    # never cause Trade.execute to even be entered — a 503 is the clear
+    # "trading disabled" signal the frontend renders as a banner.
+    if is_kill_switch_armed(user.id):
+        raise HTTPException(
+            status_code=503,
+            detail="Kill switch armed — trading disabled. POST /kill/reset to resume.",
+        )
+
     event = event.upper()
 
     cached = get_cached_trades(game_id)
@@ -639,6 +654,28 @@ async def buy_event(
         raise HTTPException(
             status_code=400,
             detail=f"No trade computed for event '{event}'. Call GET /trades/{game_id} first.",
+        )
+
+    # Freshness check: cached trades carry entry / sell_target / exit-
+    # liquidity numbers from the last /trades evaluation. Between that
+    # evaluation and the user tap the book can move — price through the
+    # edge, depth evaporates, market goes stale. Reject stale taps with
+    # 409 so the frontend refetches /trades (which re-runs every guard in
+    # _evaluate_market: stale-market, min-move, _is_dead, exit-liquidity)
+    # before re-trying the buy.
+    age = get_cached_trades_age_s(game_id)
+    if age is None or age > CACHED_TRADE_MAX_AGE_S:
+        age_str = f"{age:.2f}s" if age is not None else "missing"
+        logger.info(
+            f"/buy rejected stale cache game={game_id} event={event} "
+            f"age={age_str} max={CACHED_TRADE_MAX_AGE_S}s"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cached trade is stale — refetch /trades and retry. "
+                f"(age={age_str}, max={CACHED_TRADE_MAX_AGE_S}s)"
+            ),
         )
 
     trade_info = cached[event]
@@ -728,6 +765,9 @@ async def buy_event(
         group = await asyncio.to_thread(_fire)
         trades = group.trades
         undo_group_id = group.id
+    except KillSwitchArmedError as e:
+        # Raced with /kill between the top-of-endpoint check and execute.
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Trade failed: {e}")
 
@@ -751,10 +791,15 @@ async def cancel_trade(
     user: CurrentUser = Depends(get_current_user),
 ):
     """
-    Cancel a trade during the 3-second undo window after buy.
+    User-initiated exit. Handles two cases:
 
-    IOC sells all contracts at market and marks the position canceled.
-    Only works while status is "undo_window".
+      - `undo_window`: 3-second post-buy undo. No resting sell yet, so
+        we just IOC the held qty.
+      - `open`: "instant sell" on a resting position. Cancels the
+        resting limit sell, then IOC-exits at market. Realized P&L
+        includes the loss from crossing the spread.
+
+    Returns 400 if the trade is in any other state.
     """
     try:
         result = await asyncio.to_thread(cancel_position, position_id)
@@ -763,6 +808,49 @@ async def cancel_trade(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cancel failed: {e}")
     return result
+
+
+@app.post("/kill")
+async def kill_switch_arm(user: CurrentUser = Depends(get_current_user)):
+    """Arm the kill switch for this user.
+
+    Effects:
+      - Blocks new /buy calls (503) until /kill/reset or a new game.
+      - Cancels every resting limit sell the user owns.
+      - IOC-flattens every live position the user owns.
+      - Each force-closed trade writes a 'canceled_by_kill' row with
+        exit_price + realized_pnl so P&L stays correct.
+
+    Idempotent: calling twice is safe; already-terminal trades are
+    skipped, and the flag stays set.
+    """
+    summary = await asyncio.to_thread(arm_kill_switch, user.id)
+    logger.warning(
+        f"/kill user={user.id} flattened={len(summary['flattened'])} "
+        f"skipped={len(summary['skipped'])} errors={len(summary['errors'])}"
+    )
+    return summary
+
+
+@app.post("/kill/reset")
+async def kill_switch_reset(user: CurrentUser = Depends(get_current_user)):
+    """Disarm the kill switch so /buy works again.
+
+    Does NOT re-open flattened positions. Use this when the operator has
+    investigated whatever triggered the kill and wants to resume trading
+    without starting a new game.
+    """
+    disarm_kill_switch(user.id)
+    logger.info(f"/kill/reset user={user.id}")
+    return {"armed": False}
+
+
+@app.get("/kill")
+async def kill_switch_status(user: CurrentUser = Depends(get_current_user)):
+    """Report whether the kill switch is currently armed for this user.
+    Frontend polls this (or derives from a 503 on /buy) to render the
+    'trading disabled' banner."""
+    return {"armed": is_kill_switch_armed(user.id)}
 
 
 @app.post("/debug/simulate-fill/{trade_id}")
@@ -891,6 +979,7 @@ class SettingsUpdate(BaseModel):
     dry_run: bool | None = None
     blowout_filter: bool | None = None
     multi_market: bool | None = None
+    session_loss_limit: float | None = None
 
 
 # Only these keys are ever read from or written to users.settings. Anything
@@ -900,6 +989,7 @@ USER_SETTINGS_KEYS = {
     "alpha", "bet_size", "max_dollars", "max_slippage_cents",
     "use_undo_window", "use_stop_loss", "stop_loss_cents",
     "dry_run", "blowout_filter", "multi_market", "min_move_cents",
+    "session_loss_limit",
 }
 
 

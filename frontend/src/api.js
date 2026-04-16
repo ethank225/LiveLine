@@ -71,6 +71,12 @@ export const api = {
     return new EventSource(url.toString())
   },
 
+  // Kill switch — flattens every open position and blocks new /buy
+  // until /kill/reset or a new game session.
+  killSwitch: () => authedFetch('/kill', { method: 'POST' }),
+  killSwitchReset: () => authedFetch('/kill/reset', { method: 'POST' }),
+  killSwitchStatus: () => authedFetch('/kill'),
+
   // Auth helpers
   me: () => authedFetch('/auth/me'),
   logout: () => authedFetch('/auth/logout', { method: 'POST' }),

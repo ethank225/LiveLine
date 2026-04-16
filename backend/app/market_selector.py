@@ -87,6 +87,12 @@ DEFAULT_SETTINGS: dict = {
     # quotes flickering but no real depth — guarantees we can exit without
     # blowing past the stop-loss distance. 0 disables the gate.
     "exit_slippage_cents": 5,
+    # Hard floor on session-level realized P&L. When Session.realized_pnl
+    # drops to or below this, Trade.execute() short-circuits with
+    # KillSwitchArmedError → /buy returns 503. Negative = loss threshold
+    # (e.g. -1500 means "stop trading if the session is down $1500").
+    # 0 disables the guard. Cleared when a fresh Session is created.
+    "session_loss_limit": -1500.0,
 }
 
 
@@ -121,6 +127,11 @@ def clamp_settings(update: dict) -> dict:
         out["stale_market_seconds"] = max(0, int(update["stale_market_seconds"]))
     if "exit_slippage_cents" in update and update["exit_slippage_cents"] is not None:
         out["exit_slippage_cents"] = max(0, int(update["exit_slippage_cents"]))
+    if "session_loss_limit" in update and update["session_loss_limit"] is not None:
+        # Negative = loss floor. Clamped to [-10000, 0] so an accidental
+        # positive value (would trip immediately) or an absurd floor is
+        # coerced to something the guard can actually enforce.
+        out["session_loss_limit"] = max(-10000.0, min(0.0, float(update["session_loss_limit"])))
     return out
 
 
@@ -173,7 +184,19 @@ _teams_lock = threading.Lock()
 
 # game_id -> { event: trade_info_dict }
 _trade_cache: dict[int, dict] = {}
+# game_id -> time.time() when the cache entry was written. Parallel to
+# _trade_cache so /buy can reject taps on stale cached trades (C1 audit
+# fix: human tap latency between /trades and /buy can mean entry/stop/
+# target reference a market state that moved). A refetch via /trades
+# rebuilds the cache with fresh guards.
+_trade_cache_timestamps: dict[int, float] = {}
 _cache_lock = threading.Lock()
+
+# /buy rejects cache entries older than this. Frontend polls /trades on
+# an SSE tick so a fresh cache is always within ~1s during active play.
+# A 5s window is generous enough to tolerate brief SSE hiccups while
+# still catching books that moved during user reaction time.
+CACHED_TRADE_MAX_AGE_S = 5.0
 
 
 def set_game_deltas(game_id: int, deltas: list[EventDelta]):
@@ -192,6 +215,18 @@ def get_cached_trades(game_id: int) -> dict | None:
     """Return pre-computed best trades from cache, or None."""
     with _cache_lock:
         return _trade_cache.get(game_id)
+
+
+def get_cached_trades_age_s(game_id: int) -> float | None:
+    """Return seconds since this game's trade cache was last refreshed,
+    or None if nothing is cached. /buy uses this to reject taps on stale
+    cached trades (see CACHED_TRADE_MAX_AGE_S)."""
+    import time
+    with _cache_lock:
+        ts = _trade_cache_timestamps.get(game_id)
+    if ts is None:
+        return None
+    return time.time() - ts
 
 
 # ---------------------------------------------------------------------------
@@ -935,9 +970,12 @@ def compute_best_trades(
             empty["all_trades"] = []
             result[d.event] = empty
 
-    # Update cache
+    # Update cache + freshness stamp. /buy checks the stamp to reject
+    # taps fired against a cache that's older than CACHED_TRADE_MAX_AGE_S.
+    import time
     with _cache_lock:
         _trade_cache[game_id] = result
+        _trade_cache_timestamps[game_id] = time.time()
 
     return result
 
@@ -1047,6 +1085,31 @@ def sse_subscriber_count(game_id: int) -> int:
 def notify_sse_game_state(game_id: int, game_state: dict):
     """Push a game_state update to all SSE subscribers (user-agnostic)."""
     _push_sse(game_id, {"type": "game_state", "game_state": game_state})
+
+
+def notify_sse_session_limit(
+    game_id: int, user_id: str, *, pnl: float, limit: float,
+) -> None:
+    """Fire-once SSE event when a user's session_loss_limit trips.
+
+    Frontend renders a persistent 'Session loss limit reached' banner
+    and disables buy buttons for the duration of the session. Scoped to
+    the owning user so co-watchers on the game don't see the banner.
+    """
+    if _loop is None:
+        return
+    payload = {
+        "type": "session_limit_reached",
+        "game_id": game_id,
+        "pnl": float(pnl),
+        "limit": float(limit),
+    }
+    with _sse_lock:
+        subs = list(_sse_queues.get(game_id, []))
+    for queue, uid in subs:
+        if uid != user_id:
+            continue
+        _loop.call_soon_threadsafe(queue.put_nowait, payload)
 
 
 def notify_sse_positions_changed(game_id: int, user_id: str | None = None) -> None:
