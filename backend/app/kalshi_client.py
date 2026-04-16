@@ -58,6 +58,19 @@ def _decode_pem(env_var: str, fallback_filename: str) -> str | None:
 demo_pem_path = _decode_pem("KALSHI_DEMO_KEY_B64", "kalshi-demo-key.pem")
 prod_pem_path = _decode_pem("KALSHI_PROD_KEY_B64", "kalshi-prod-key.pem")
 
+import pykalshi
+
+# Schema patches below target this exact version. Bumping pykalshi without
+# re-verifying _sanitize_payload against the new wire-format bindings will
+# silently break orderbook snapshots and/or crash the feed read loop.
+_EXPECTED_PYKALSHI = "1.0.4"
+if getattr(pykalshi, "__version__", None) != _EXPECTED_PYKALSHI:
+    raise RuntimeError(
+        f"pykalshi {_EXPECTED_PYKALSHI} required; got "
+        f"{getattr(pykalshi, '__version__', 'unknown')}. Re-verify the "
+        "schema-drift patches in kalshi_client.py before bumping."
+    )
+
 from pykalshi import (
     KalshiClient,
     MarketStatus,

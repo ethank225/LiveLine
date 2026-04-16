@@ -17,6 +17,7 @@ from app.engine import (
     get_win_expectancy,
     load_win_expectancy_table,
     _convolve,
+    _DOUBLE_TABLE,
     _remaining_halves,
     _runs_scored,
 )
@@ -138,14 +139,35 @@ class TestEventTransitions:
         assert s.runners == expected_runners
         assert s.score_diff == expected_runs  # bot half, home scores
 
-    @pytest.mark.parametrize("runners,expected_runs", [
-        ("000", 0), ("100", 1), ("010", 1), ("001", 1),
-        ("110", 2), ("101", 2), ("011", 2), ("111", 3),
+    @pytest.mark.parametrize("runners,expected_branches,expected_runs", [
+        # Deterministic configs (no R1 on base): one outcome.
+        ("000", 1, 0.0),
+        ("010", 1, 1.0),
+        ("001", 1, 1.0),
+        ("011", 1, 2.0),
+        # Probabilistic configs (R1 on base): two outcomes split 45/55
+        # between "R1 scores" and "R1 stops at 3B". Expected-runs values
+        # are 0.45·(runs if R1 scores) + 0.55·(runs if R1 doesn't).
+        ("100", 2, 0.45),
+        ("110", 2, 1.45),
+        ("101", 2, 1.45),
+        ("111", 2, 2.45),
     ])
-    def test_double_all_configs(self, runners, expected_runs):
-        s = apply_event(GameState(5, "bot", 0, runners, 0), "2B")
-        assert s.runners == "010"  # batter on 2nd, everyone else scores
-        assert s.score_diff == expected_runs
+    def test_double_all_configs(self, runners, expected_branches, expected_runs):
+        """Pin _DOUBLE_TABLE's probabilistic shape. R1-on-base configs
+        have two branches (45% scores / 55% stops at 3B); the rest are
+        deterministic. Branch probabilities must sum to 1.0 and the
+        expected-runs weighted average must match the parametrized value.
+
+        Replaces an older deterministic test that asserted
+        `s.runners == "010"` and integer `expected_runs` — that model
+        doesn't hold since 2B became probabilistic, and `apply_event` no
+        longer returns a single canonical post-state for 2B."""
+        branches = _DOUBLE_TABLE[runners]
+        assert len(branches) == expected_branches
+        assert sum(p for p, _, _ in branches) == pytest.approx(1.0)
+        weighted_runs = sum(p * r for p, _, r in branches)
+        assert weighted_runs == pytest.approx(expected_runs)
 
     @pytest.mark.parametrize("runners,expected_runs", [
         ("000", 1), ("100", 2), ("010", 2), ("001", 2),
@@ -171,6 +193,16 @@ class TestEventTransitions:
         s = apply_event(GameState(5, "bot", 0, "111", 0), "DP")
         assert s.outs == 2
         assert s.runners == "001"  # 2nd to 3rd, 3rd scores
+        assert s.score_diff == 1
+
+    def test_dp_r1_r3_force_scores(self):
+        """Force DP from "101": R1 forced at 2B, batter out at 1B, R3
+        scores on the play. Nobody remains on base — the old
+        `_DP_TABLE["101"] = ("010", 1)` was physically impossible (there
+        is no runner at 2B once R1 is the force-out)."""
+        s = apply_event(GameState(5, "bot", 0, "101", 0), "DP")
+        assert s.outs == 2
+        assert s.runners == "000"
         assert s.score_diff == 1
 
     def test_dp_third_out_flips(self):

@@ -17,8 +17,10 @@ RLS. End-user reads go through the frontend's anon-key client.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -97,6 +99,85 @@ def _ts_from_ms(ms: int | float | None) -> str | None:
         return datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc).isoformat()
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# EAGAIN retry wrapper
+#
+# On Railway (never locally), concurrent Supabase writes from the /buy
+# fan-out — log_trade on the threadpool worker, snapshot inserts in daemon
+# threads, update_trade_status("open") right after — intermittently surface
+# OSError(errno=11, EAGAIN) out of httpx's transport. The per-helper
+# try/except swallows it per the "never raise" contract, which means the
+# status=open write is dropped and the trade row lies about its state until
+# a later lifecycle write happens to succeed.
+#
+# The fix is a targeted retry that catches ONLY EAGAIN and lets every other
+# exception flow straight through to the outer handler. No public API
+# change; the "never raise" contract is untouched.
+# ---------------------------------------------------------------------------
+
+# EAGAIN's errno value is platform-dependent — 11 on Linux (what Railway
+# raises) and 35 on macOS/BSD (what dev machines raise). Match both
+# literals so production detection and local tests stay aligned without
+# needing platform-conditional code.
+_EAGAIN_ERRNOS = {errno.EAGAIN, errno.EWOULDBLOCK, 11, 35}
+
+
+def _is_eagain(exc: BaseException) -> bool:
+    """Walk the exception chain looking for EAGAIN / EWOULDBLOCK.
+    supabase-py surfaces socket-level errors via httpx, which wraps them
+    in its own exception types — the OSError we care about may only be
+    reachable via `__cause__` / `__context__`.
+
+    `BlockingIOError` is Python's canonical subclass for EAGAIN /
+    EWOULDBLOCK / EINPROGRESS, so isinstance is sufficient when the
+    exception was auto-dispatched from an OSError(errno=EAGAIN). For bare
+    OSErrors we fall back to matching errno against both platforms'
+    EAGAIN values."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, BlockingIOError):
+            return True
+        if isinstance(cur, OSError) and getattr(cur, "errno", None) in _EAGAIN_ERRNOS:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _execute_with_eagain_retry(
+    execute_callable,
+    *,
+    op_name: str,
+    retries: int = 2,
+    backoff_s: float = 0.075,
+):
+    """Run `execute_callable()` (a zero-arg lambda ending in `.execute()`),
+    retrying ONLY on EAGAIN. Any other exception re-raises immediately so
+    the caller's outer try/except can log + swallow per the module contract.
+
+    On EAGAIN exhaustion, the final exception propagates to the caller's
+    try/except. The "never raise" contract is preserved because callers
+    still wrap the whole thing in try/except Exception.
+    """
+    last: BaseException | None = None
+    for attempt in range(retries + 1):
+        try:
+            return execute_callable()
+        except Exception as e:
+            if not _is_eagain(e):
+                raise
+            last = e
+            if attempt < retries:
+                logger.warning(
+                    f"{op_name}: EAGAIN (attempt {attempt + 1}/{retries + 1}), "
+                    f"retrying in {int(backoff_s * 1000)}ms"
+                )
+                time.sleep(backoff_s)
+    assert last is not None
+    raise last
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +369,10 @@ def log_trade(
             "fee_adjusted": trade_info.get("fee_adjusted"),
             "gross_pick_ticker": trade_info.get("gross_pick_ticker"),
         }
-        inserted = client.table("trades").insert(row).execute()
+        inserted = _execute_with_eagain_retry(
+            lambda: client.table("trades").insert(row).execute(),
+            op_name="log_trade",
+        )
         if inserted.data:
             tid = inserted.data[0]["id"]
             logger.info(f"log_trade: inserted trade {tid}")
@@ -344,7 +428,10 @@ def update_trade_status(
             "canceled_by_user", "canceled_by_kill", "error", "no_fill",
         ):
             patch["closed_at"] = _iso(datetime.now(timezone.utc))
-        resp = client.table("trades").update(patch).eq("id", trade_id).execute()
+        resp = _execute_with_eagain_retry(
+            lambda: client.table("trades").update(patch).eq("id", trade_id).execute(),
+            op_name=f"update_trade_status({status})",
+        )
         logger.info(f"update_trade_status: patched trade {trade_id} → {status} ({len(resp.data or [])} rows)")
     except Exception as e:
         logger.error(f"update_trade_status failed (id={trade_id} status={status}): {e}")
@@ -493,7 +580,11 @@ def log_orderbook_snapshot(
                 break
             row[f"ask_{i}_price"] = float(price)
             row[f"ask_{i}_qty"] = int(qty)
-        client.table("orderbook_snapshots").insert(row).execute()
+        _execute_with_eagain_retry(
+            lambda: client.table("orderbook_snapshots").insert(row).execute(),
+            op_name="log_orderbook_snapshot",
+            retries=1,
+        )
     except Exception as e:
         logger.error(
             f"log_orderbook_snapshot failed (trade_id={trade_id} "
