@@ -42,8 +42,12 @@ Every sweep imports from `sweeps._common` (see below). Run with `python -m backt
 |---|---|---|
 | `alpha.py` | Which alpha maximizes net P&L? | Table of α ∈ [0.30, 0.80] step 0.05: trades, fill%, avg-profit/fill, avg-loss/miss, net, $/game, worst. |
 | `alpha_minmove.py` | 2D: which (α, min_move_cents) combo wins? What's the Pareto frontier? | Sorted 36-cell table + top-5 highlight + Pareto frontier summary. |
+| `ratio.py` | Where does the `min_move_to_fee_ratio` gate stop helping? Is there a bend? | Sorted table across ratio ∈ [1.0, 3.0]: trades, fill%, net, $/game, worst. CSV to `reports/`. |
+| `ratio_2d.py` | (min_move_cents, min_move_to_fee_ratio) grid — is the flat floor still load-bearing once the ratio gate exists? | Sorted cell table + Pareto frontier. CSV to `reports/`. |
+| `alpha_ratio.py` | (α, ratio) interaction — does optimal α shift once the ratio gate is tightened? | 2D grid with per-cell stats + top-5 highlight. |
 | `hr_alpha.py` | Does a lower HR-specific alpha raise total P&L? | HR n, HR fill%, HR net, total net, Δ vs α=0.65 baseline, worst day. |
 | `offset_fill.py` | How does fill rate change with entry timing, by event type? | Matrix of offset (t−10s → t+10s) × event type (HR/2B/1B/BB/DP/OUT/K). CSV to `reports/`. |
+| `fill_margin.py` | How much fill-rate headroom does the strategy have before EV flips sign? | Current fill rate, breakeven fill rate from `f_be = −L/(W−L)`, and the margin between them. Per-trade (production-meaningful) and per-contract (reference) reported side-by-side. |
 | `analyze_losers.py` | Why do the worst-P&L games lose money? | Per-trade classification (never_reached / touched_but_missed / no_market_data / extreme_entry) across 3 losers vs 1 winner. Reads the latest `multi_market_single_trades_*.csv` from `reports/`. |
 
 ## `sweeps/_common.py` — shared sweep helpers

@@ -39,7 +39,7 @@ Live at [liveline.watch](https://liveline.watch).
 
 4. **Frontend** (`frontend/`) connects via Server-Sent Events to `/stream/{game_id}` and renders a button per batting event, recolored every tick with current EV + entry + target. Tapping fires `/buy`. Positions show live P&L against Kalshi's current bid.
 
-Live Kalshi data pushes the whole loop: every websocket tick triggers a recompute for every subscribed game and fans out to connected clients. MLB game state is polled every 10 seconds per active game.
+Live Kalshi data pushes the whole loop: every websocket tick triggers a recompute for every subscribed game and fans out to connected clients. MLB game state is polled every 10 seconds per active game. The same poll step also runs `market_selector.refresh_markets` to pick up any new Kalshi spread / O/U lines listed mid-game, so the dynamic line picker isn't frozen on the opening ticker set.
 
 ---
 
