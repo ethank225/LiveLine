@@ -85,6 +85,12 @@ def _main_inner():
     parser.add_argument("--min-move-cents", type=int, default=4,
                         help="Skip trades whose expected entry→target move is "
                              "below N cents (mirrors live min_move_cents; default 4).")
+    parser.add_argument("--min-move-to-fee-ratio", type=float, default=0.0,
+                        help="Price-aware min-move floor: target move must be "
+                             "at least N× per-contract round-trip fee. "
+                             "0 disables (default), 1.0 = breakeven, 2.0 = "
+                             "live-picker default. Applies in addition to "
+                             "--min-move-cents (both must pass).")
     parser.add_argument("--no-fees", action="store_true",
                         help="Disable Kalshi fee deduction (for A/B against the "
                              "old fee-free backtest). Default: fees on.")
@@ -409,6 +415,7 @@ def _main_inner():
                 min_move=args.min_move_cents / 100.0,
                 fees_on=not args.no_fees,
                 blowout_filter=not args.no_blowout_filter,
+                min_move_to_fee_ratio=args.min_move_to_fee_ratio,
             )
             print_comparison(single_trades, multi_trades,
                              args.alpha, args.max_dollars)

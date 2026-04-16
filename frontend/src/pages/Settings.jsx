@@ -11,6 +11,7 @@ const AUTO_SAVE_KEYS = [
   'alpha',
   'max_slippage_cents',
   'min_move_cents',
+  'min_move_to_fee_ratio',
   'dry_run',
   'multi_market',
   'use_undo_window',
@@ -157,9 +158,9 @@ export default function Settings() {
               control={
                 <Stepper
                   value={settings.alpha}
-                  onChange={v => update('alpha', round1(v))}
-                  min={0.1} max={1.0} step={0.1}
-                  format={v => (+v).toFixed(1)}
+                  onChange={v => update('alpha', round(v, 0.01))}
+                  min={0.1} max={1.0} step={0.01}
+                  format={v => (+v).toFixed(2)}
                   valueClass="text-emerald-400"
                 />
               }
@@ -185,6 +186,18 @@ export default function Settings() {
                   onChange={v => update('min_move_cents', v)}
                   min={0} max={20} step={1}
                   format={v => `${v}¢`}
+                />
+              }
+            />
+            <Row
+              label="Min move/fee ratio"
+              desc="Target move as a multiple of round-trip fees"
+              control={
+                <Stepper
+                  value={settings.min_move_to_fee_ratio ?? 2.0}
+                  onChange={v => update('min_move_to_fee_ratio', round(v, 0.1))}
+                  min={1.0} max={5.0} step={0.1}
+                  format={v => `${(+v).toFixed(1)}x`}
                 />
               }
               last
@@ -526,8 +539,4 @@ function round(n, step) {
   const decimals = (String(step).split('.')[1] || '').length
   const m = 10 ** decimals
   return Math.round(n * m) / m
-}
-
-function round1(n) {
-  return Math.round(n * 10) / 10
 }

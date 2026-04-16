@@ -693,15 +693,13 @@ async def buy_event(
             detail=f"No Kalshi market found for event '{event}'.",
         )
 
-    # Decision-log dump. Fires once per /buy tap (not per SSE recompute),
-    # so grep "DECISION HR" surfaces the full candidate+rejection set that
-    # produced this specific trade.
+    # Decision-log capture. Emission is deferred until AFTER the Kalshi
+    # buy has fired so the formatted multi-line logger.info(...) — which
+    # blocks on stdout flush, meaningfully on Railway — doesn't sit
+    # between "decision made" and "order sent." The log is pure
+    # observability derived from the candidate dict; moving it loses no
+    # information. See the `decision_log_after_fire` test.
     decision = trade_info.get("decision_log")
-    if decision:
-        try:
-            logger.info(format_decision_log(decision))
-        except Exception as e:
-            logger.warning(f"format_decision_log failed for event={event}: {e}")
 
     # Snapshot game state for the trade row. Prefer the polling-cached copy;
     # fall back to a fresh fetch if the cache is cold (first user interaction
@@ -781,6 +779,16 @@ async def buy_event(
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Trade failed: {e}")
+
+    # Deferred decision-log emission (see capture comment above). The
+    # Kalshi IOC buy has now fired and the initial log_trade insert has
+    # already happened inside Trade.execute; emitting here keeps the
+    # formatted-log cost off the critical path.
+    if decision:
+        try:
+            logger.info(format_decision_log(decision))
+        except Exception as e:
+            logger.warning(f"format_decision_log failed for event={event}: {e}")
 
     # Response shape is uniform — frontend always gets a list of positions
     # plus the group id. Single-market mode is just a group of one.
@@ -984,6 +992,7 @@ class SettingsUpdate(BaseModel):
     max_dollars: float | None = None
     max_slippage_cents: int | None = None
     min_move_cents: int | None = None
+    min_move_to_fee_ratio: float | None = None
     use_undo_window: bool | None = None
     use_stop_loss: bool | None = None
     stop_loss_cents: int | None = None
@@ -1000,6 +1009,7 @@ USER_SETTINGS_KEYS = {
     "alpha", "bet_size", "max_dollars", "max_slippage_cents",
     "use_undo_window", "use_stop_loss", "stop_loss_cents",
     "dry_run", "blowout_filter", "multi_market", "min_move_cents",
+    "min_move_to_fee_ratio",
     "session_loss_limit",
 }
 

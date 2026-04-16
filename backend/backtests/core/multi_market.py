@@ -50,11 +50,18 @@ def _sell_target(entry_price: float, predicted_delta: float, alpha: float) -> fl
 def _build_candidates(
     group: list[dict], alpha: float,
     min_move: float = 0.0, blowout_filter: bool = True,
+    min_move_to_fee_ratio: float = 0.0,
 ) -> list[dict]:
     """From a set of synced records sharing the same play, build candidate trades.
 
     `min_move` (in dollars, e.g. 0.04) filters candidates whose expected
     entry→target move won't clear round-trip fees.
+
+    `min_move_to_fee_ratio` (unitless, 0 disables, default live value 2.0)
+    applies a price-aware floor on top of `min_move`: the target move must
+    be at least this many multiples of the per-contract round-trip fee.
+    Candidate must clear BOTH filters — mirrors the live picker's
+    `_evaluate_market` gate order.
 
     `blowout_filter` (default True) skips MONEYLINE candidates when the
     score margin at this play is >= BLOWOUT_THRESHOLD — mirrors the live
@@ -90,6 +97,23 @@ def _build_candidates(
         # whose expected move is too small to cover round-trip fees.
         if alpha * abs(pred) < min_move:
             continue
+        # Price-aware min-move floor. Live gate at market_selector.py
+        # compares target_move_cents against per-contract round-trip
+        # fee; mirror it here using the same taker/maker formulas.
+        if min_move_to_fee_ratio > 0:
+            sell_target = _sell_target(entry, pred, alpha)
+            # Per-contract fees in cents. bet_size=100 matches the live
+            # path's ceiling-rounding resolution.
+            entry_fee_per_c = taker_fee(
+                contracts=100, price_dollars=entry,
+            ) / 100 * 100
+            exit_fee_per_c = maker_fee(
+                contracts=100, price_dollars=sell_target,
+            ) / 100 * 100
+            rt_fee_cents = entry_fee_per_c + exit_fee_per_c
+            move_cents = abs(sell_target - entry) * 100
+            if rt_fee_cents > 0 and move_cents / rt_fee_cents < min_move_to_fee_ratio:
+                continue
         ticker = rec.get("market_ticker", "")
         if ticker and ticker in seen_tickers:
             continue
@@ -251,6 +275,7 @@ def run_comparison(
     all_synced: list[dict], alpha: float, max_dollars: float,
     min_move: float = 0.04, fees_on: bool = True,
     blowout_filter: bool = True,
+    min_move_to_fee_ratio: float = 0.0,
 ) -> tuple[list[dict], list[dict]]:
     """Run both modes on the same candidate set. Returns (single, multi).
 
@@ -269,6 +294,7 @@ def run_comparison(
     for group in groups.values():
         candidates = _build_candidates(
             group, alpha, min_move=min_move, blowout_filter=blowout_filter,
+            min_move_to_fee_ratio=min_move_to_fee_ratio,
         )
         if candidates and fees_on:
             _annotate_net_ev(candidates, max_dollars, fees_on)

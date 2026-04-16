@@ -1007,6 +1007,14 @@ class Trade:
             f"@${self.entry_price:.2f} → filled "
             f"(target=${self.sell_target:.2f}, stop=${self.stop_loss:.2f})"
         )
+        # Snapshot of the settings that produced this trade, one line so
+        # ops can correlate a specific BUY with the active config at
+        # that instant without diffing the DB row against current state.
+        settings_str = " ".join(
+            f"{k}={self._settings[k]}"
+            for k in sorted(self._settings.keys())
+        )
+        logger.info(f"{self._log_prefix} SETTINGS {settings_str}")
 
         if self.use_undo_window:
             self._undo_timer = threading.Timer(UNDO_WINDOW_SECONDS, self._activate)
@@ -1980,6 +1988,7 @@ _SETTINGS_WHITELIST = frozenset({
     "alpha", "bet_size", "max_dollars", "max_slippage_cents",
     "use_undo_window", "use_stop_loss", "stop_loss_cents",
     "dry_run", "blowout_filter", "multi_market", "min_move_cents",
+    "min_move_to_fee_ratio",
     "session_loss_limit",
 })
 

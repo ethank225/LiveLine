@@ -467,7 +467,10 @@ class KalshiManager:
         with self._lock:
             book = self._books.get(ticker)
 
-        if book is not None and book.best_ask is not None:
+        # Don't gate on best_ask here either — it's tied to book.no alone,
+        # so a populated book.yes with empty book.no would falsely skip
+        # the local read for NO-side depth probes.
+        if book is not None:
             same_side = book.yes if side == "YES" else book.no
             opp_side = book.no if side == "YES" else book.yes
             bid_raw = _parse_dict(same_side, flip=False)
@@ -689,26 +692,30 @@ class KalshiManager:
         """
         Get ask levels for a side. Reads from local OrderbookManager
         (microseconds, no network) if available, else falls back to REST.
+
+        NO-side asks come from YES-side bids (book.yes) via `1 - p`; YES-side
+        asks come from NO-side bids (book.no). Gate on the specific dict
+        needed, NOT on `book.best_ask` — that property is derived from
+        `book.no` and returns None when only NO-side bids are empty, which
+        would falsely skip the local read for a NO-side sizing call whose
+        relevant dict (book.yes) is fully populated.
         """
         with self._lock:
             book = self._books.get(market_ticker)
 
-        if book and book.best_ask is not None:
-            # Local book: read the opposite side's dict (NO bids → YES asks)
-            if side == "YES":
-                raw = dict(book.no)
-            else:
-                raw = dict(book.yes)
-
-            levels = []
-            for price_str, qty_str in raw.items():
-                ask_price = round(1.0 - float(price_str), 4)
-                qty = int(float(qty_str))
-                if qty > 0:
-                    levels.append((ask_price, qty))
-            levels.sort()
-            if levels:
-                return levels
+        if book is not None:
+            # Local book: read the opposite side's dict (NO bids → YES asks).
+            raw = dict(book.no) if side == "YES" else dict(book.yes)
+            if raw:
+                levels = []
+                for price_str, qty_str in raw.items():
+                    ask_price = round(1.0 - float(price_str), 4)
+                    qty = int(float(qty_str))
+                    if qty > 0:
+                        levels.append((ask_price, qty))
+                levels.sort()
+                if levels:
+                    return levels
 
         # Fallback: REST API (local book empty or not subscribed)
         if not self.client:
@@ -766,7 +773,16 @@ class KalshiManager:
 
         with self._lock:
             book = self._books.get(market_ticker)
-            has_local = book is not None and book.best_ask is not None
+            # Side-specific gate: for NO sizing we read book.yes, so require
+            # book.yes to be populated. `best_ask` is derived from book.no
+            # and would falsely mark has_local=False when book.no is empty
+            # but book.yes has depth.
+            if book is None:
+                has_local = False
+            elif side == "YES":
+                has_local = bool(book.no)
+            else:
+                has_local = bool(book.yes)
 
         ask_levels = self._get_ask_levels(market_ticker, side)
         source = "local" if has_local else "rest"
@@ -839,7 +855,14 @@ class KalshiManager:
         """
         with self._lock:
             book = self._books.get(ticker)
-            has_local = book is not None and book.best_ask is not None
+            # Side-specific gate — see calculate_position_size for why
+            # best_ask alone isn't sufficient.
+            if book is None:
+                has_local = False
+            elif side == "YES":
+                has_local = bool(book.no)
+            else:
+                has_local = bool(book.yes)
 
         if has_local:
             sized = self.calculate_position_size(

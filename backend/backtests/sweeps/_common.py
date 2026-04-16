@@ -132,6 +132,7 @@ def run_silent(
     max_dollars: float = MAX_DOLLARS,
     fees_on: bool = True,
     blowout_filter: bool = True,
+    min_move_to_fee_ratio: float = 0.0,
 ) -> tuple[list[dict], list[dict]]:
     """run_comparison with the "Fee filter killed N" stdout line
     swallowed. Returns (single_trades, multi_trades)."""
@@ -139,6 +140,7 @@ def run_silent(
         return run_comparison(
             all_synced, alpha, max_dollars,
             min_move=min_move, fees_on=fees_on, blowout_filter=blowout_filter,
+            min_move_to_fee_ratio=min_move_to_fee_ratio,
         )
 
 

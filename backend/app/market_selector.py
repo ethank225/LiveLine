@@ -74,8 +74,17 @@ DEFAULT_SETTINGS: dict = {
     "multi_market": False,
     # Minimum expected entry→target move (cents) for a trade to clear
     # Kalshi round-trip fees. Filters at the eval layer so sub-threshold
-    # trades never reach the button grid.
+    # trades never reach the button grid. Works alongside the price-aware
+    # `min_move_to_fee_ratio` below — candidates must clear BOTH gates
+    # (absolute floor + ratio floor).
     "min_move_cents": 4,
+    # Price-aware minimum-move floor. Required ratio of target move to
+    # per-contract round-trip fee — scales with Kalshi's fee schedule so
+    # cheap contracts (small fees) aren't over-filtered by a flat cents
+    # threshold and expensive contracts (large fees) aren't under-filtered.
+    # 2.0 = "target must cover round-trip fees 2x over". 1.0 = breakeven
+    # (effectively disables the ratio gate). 0 disables entirely.
+    "min_move_to_fee_ratio": 2.0,
     # Skip a market if no websocket tick has arrived in this many seconds.
     # Cheap first filter — answers "is this market alive at all?" — paired
     # with the exit-liquidity check below which answers "can I get out?".
@@ -121,6 +130,13 @@ def clamp_settings(update: dict) -> dict:
         out["blowout_filter"] = bool(update["blowout_filter"])
     if "min_move_cents" in update and update["min_move_cents"] is not None:
         out["min_move_cents"] = max(0, int(update["min_move_cents"]))
+    if (
+        "min_move_to_fee_ratio" in update
+        and update["min_move_to_fee_ratio"] is not None
+    ):
+        out["min_move_to_fee_ratio"] = max(
+            0.0, float(update["min_move_to_fee_ratio"]),
+        )
     if "multi_market" in update and update["multi_market"] is not None:
         out["multi_market"] = bool(update["multi_market"])
     if "stale_market_seconds" in update and update["stale_market_seconds"] is not None:
@@ -456,10 +472,45 @@ def _pick_ou_market(total_runs: int, markets: list[MarketInfo]) -> MarketInfo | 
 def _pick_spread_markets_both_sides(
     margin: int, markets: list[MarketInfo]
 ) -> list[MarketInfo]:
+    """Pick the home-side spread line via `pick_spread_line`, then locate
+    the away-side ticker whose economic mirror is the same line magnitude
+    (away-side `MarketInfo.line` is stored as `-line` with `flip=True`).
+
+    Running `pick_spread_line` independently on the away bucket was the
+    prior bug: its "smallest dist > 0" logic never matches when every
+    candidate's stored line is negative, so the function fell back to
+    closest-abs-to-margin and typically picked a non-mirror line (e.g.
+    home WSH-2 at line 1.5 paired with away PIT-1 at -0.5). That meant
+    the complement ticker PIT-2 (line -1.5, whose NO side is the economic
+    equivalent of WSH +1.5) never entered the candidate set.
+
+    Mirror selection — not independent pick — preserves the "one matched
+    YES/NO pair per event" invariant the decision log assumes. If Kalshi
+    coverage is asymmetric (home-side ticker exists but no away-side
+    ticker at the mirror line), we emit a debug log and return just the
+    home side rather than substituting a wrong line.
+    """
     sp = [m for m in markets if m.market_type == "spread"]
-    home_side = pick_spread_line(margin, [m for m in sp if not m.flip])
-    away_side = pick_spread_line(margin, [m for m in sp if m.flip])
-    return [m for m in (home_side, away_side) if m is not None]
+    home_bucket = [m for m in sp if not m.flip]
+    away_bucket = [m for m in sp if m.flip]
+
+    home_side = pick_spread_line(margin, home_bucket)
+    if home_side is None:
+        return []
+
+    mirror_line = -home_side.line
+    away_side = next(
+        (m for m in away_bucket if m.line == mirror_line),
+        None,
+    )
+    if away_side is None:
+        logger.debug(
+            f"_pick_spread_markets_both_sides: no away-side mirror for "
+            f"home line={home_side.line} (mirror={mirror_line}); "
+            f"away coverage appears asymmetric, returning home only"
+        )
+        return [home_side]
+    return [home_side, away_side]
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +567,7 @@ def _evaluate_market(
     home_abbr: str = "",
     away_abbr: str = "",
     min_move_cents: int = 0,
+    min_move_to_fee_ratio: float = 0.0,
     stale_market_seconds: int = 0,
     exit_slippage_cents: int = 0,
     max_dollars: float = 0.0,
@@ -572,6 +624,11 @@ def _evaluate_market(
     best = None
     yes_reason = "skipped: d<=0"
     no_reason = "skipped: d>=0"
+    # Captured when each side's EV is computed (kept/dead branches). Used
+    # only to pick a deterministic "primary side" for the decision log
+    # header when BOTH sides fail — a display choice, not a filter.
+    yes_ev: float | None = None
+    no_ev: float | None = None
 
     # Dead-market gates. Any side hitting these is a guaranteed loss or no
     # upside — skip it entirely so it never lands in all_trades for
@@ -589,6 +646,7 @@ def _evaluate_market(
     if d > 0 and yes_ask > 0 and yes_bid > 0:
         spread = yes_ask - yes_bid
         ev = alpha * d - spread
+        yes_ev = ev
         sell_target = min(yes_ask + alpha * d, 0.99)
         if _is_dead(yes_ask, sell_target):
             yes_reason = (
@@ -617,6 +675,7 @@ def _evaluate_market(
         spread = no_ask - no_bid
         abs_d = abs(d)
         ev = alpha * abs_d - spread
+        no_ev = ev
         sell_target = min(no_ask + alpha * abs_d, 0.99)
         if _is_dead(no_ask, sell_target):
             no_reason = (
@@ -645,10 +704,37 @@ def _evaluate_market(
     logger.info(f"{prefix}   NO  ({no_label}) {no_reason}")
 
     if best is None:
+        # Pick a "primary side" for the decision log header so the
+        # SKIPPED row reads consistently with PICKED/REJECTED lines
+        # (which always include YES/NO). Prefer the side that got
+        # further through evaluation — i.e. past the sign filter.
+        # `d` is a single scalar so the YES and NO eval branches are
+        # mutually exclusive; in practice at most one side will be
+        # "past sign". The both-past-sign tiebreak (higher EV) is a
+        # future-proofing fallback that's currently unreachable.
+        yes_past_sign = yes_reason != "skipped: d<=0"
+        no_past_sign = no_reason != "skipped: d>=0"
+        if yes_past_sign and no_past_sign:
+            if yes_ev is None:
+                primary_side = "NO"
+            elif no_ev is None:
+                primary_side = "YES"
+            else:
+                primary_side = "YES" if yes_ev >= no_ev else "NO"
+        elif yes_past_sign:
+            primary_side = "YES"
+        elif no_past_sign:
+            primary_side = "NO"
+        else:
+            # Both sides skipped on sign (d == 0, or no prices). Pick
+            # YES deterministically so test output is stable.
+            primary_side = "YES"
+
         logger.info(f"{prefix} → no trade")
         return _rejection(
             market, "no_viable_side",
             f"YES: {yes_reason}; NO: {no_reason}",
+            side=primary_side,
         )
     # Round-trip fees eat profit on sub-threshold moves. Filter here so
     # the trade never reaches the button grid.
@@ -664,6 +750,42 @@ def _evaluate_market(
             f"move={move_cents}¢ < {min_move_cents}¢",
             side=best["side"],
         )
+    # Price-aware floor. Kalshi fees scale with p*(1-p), so a flat cents
+    # threshold over-filters cheap contracts (small fees → a 2¢ move can
+    # be profitable) and under-filters expensive ones (large fees → even
+    # 3¢ barely clears round-trip). The ratio gate normalizes by the
+    # actual per-contract round-trip fee. Same taker/maker formulas as
+    # entry_fee_est / exit_fee_est downstream — dividing by bet_size
+    # keeps the per-contract value precise (the ceiling-to-cent rounding
+    # in fee_for_contracts happens per-order, so the smaller the
+    # contracts arg, the coarser the per-contract rate).
+    if min_move_to_fee_ratio > 0:
+        entry_fee_per_c = taker_fee(
+            contracts=bet_size, price_dollars=best["entry_price"],
+        ) / bet_size * 100
+        exit_fee_per_c = maker_fee(
+            contracts=bet_size, price_dollars=best["sell_target"],
+        ) / bet_size * 100
+        round_trip_fee_cents = entry_fee_per_c + exit_fee_per_c
+        move_exact_cents = abs(best["sell_target"] - best["entry_price"]) * 100
+        ratio = (
+            move_exact_cents / round_trip_fee_cents
+            if round_trip_fee_cents > 0
+            else float("inf")
+        )
+        if ratio < min_move_to_fee_ratio:
+            picked_label = yes_label if best["side"] == "YES" else no_label
+            logger.info(
+                f"{prefix} → below fee_ratio {picked_label} ({best['side']}) "
+                f"move={move_exact_cents:.1f}¢ fees={round_trip_fee_cents:.2f}¢ "
+                f"ratio={ratio:.2f}x < {min_move_to_fee_ratio}x"
+            )
+            return _rejection(
+                market, "fee_ratio",
+                f"move={move_exact_cents:.1f}¢ fees={round_trip_fee_cents:.2f}¢ "
+                f"ratio={ratio:.2f}x < {min_move_to_fee_ratio}x",
+                side=best["side"],
+            )
     # Exit-liquidity guard. The stale-tick gate above answered "is this market
     # alive?"; this answers the harder question "can I actually get OUT?". If
     # the limit sell at target doesn't fill, we IOC into the bid book at
@@ -826,6 +948,9 @@ def compute_best_trades(
     bet_size = settings.get("bet_size", DEFAULT_SETTINGS["bet_size"])
     blowout_filter = settings.get("blowout_filter", DEFAULT_SETTINGS["blowout_filter"])
     min_move_cents = int(settings.get("min_move_cents", DEFAULT_SETTINGS["min_move_cents"]))
+    min_move_to_fee_ratio = float(settings.get(
+        "min_move_to_fee_ratio", DEFAULT_SETTINGS["min_move_to_fee_ratio"],
+    ))
     stale_market_seconds = int(settings.get(
         "stale_market_seconds", DEFAULT_SETTINGS["stale_market_seconds"],
     ))
@@ -844,6 +969,20 @@ def compute_best_trades(
         markets = list(_game_markets.get(game_id, []))
     with _teams_lock:
         home_abbr, away_abbr = _game_teams.get(game_id, ("", ""))
+
+    # `compute_display_label` needs both abbrs to flip NO-side labels
+    # (spread "SEA -1.5" NO → "DET +1.5", ML "KC" NO → "DET wins"). When
+    # `_game_teams` hasn't been populated yet — cold-start race where
+    # compute_best_trades runs before `discover_markets` (kalshi
+    # disconnected, event ticker not yet resolved) — the flip silently
+    # degrades to the same-team side. Surface the race so it's not
+    # invisible in the decision log.
+    if markets and (not home_abbr or not away_abbr):
+        logger.warning(
+            f"compute_best_trades game={game_id}: _game_teams empty "
+            f"(home={home_abbr!r} away={away_abbr!r}); NO-side spread/ML "
+            f"labels in the decision log may not flip correctly"
+        )
 
     # If scores not passed, try cached scores
     if home_score is None or away_score is None:
@@ -937,7 +1076,7 @@ def compute_best_trades(
         # --- Moneyline candidates ---
         if not (blowout_filter and is_blowout):
             for ml in ml_markets:
-                _ingest(_evaluate_market(ml, d.delta, alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents))
+                _ingest(_evaluate_market(ml, d.delta, alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, min_move_to_fee_ratio=min_move_to_fee_ratio, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents))
         elif blowout_filter and is_blowout:
             # Record the whole ML set as blowout-filtered so the decision log
             # explains why no ML candidate showed up.
@@ -951,13 +1090,13 @@ def compute_best_trades(
         if ou_market:
             ou_delta_data = d.over_under.get(str(ou_market.line))
             if ou_delta_data:
-                _ingest(_evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents))
+                _ingest(_evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, min_move_to_fee_ratio=min_move_to_fee_ratio, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents))
 
         # --- Spread candidates (home-side + away-side) ---
         for sp_market in sp_markets_picked:
             sp_delta_data = d.spread.get(str(sp_market.line))
             if sp_delta_data:
-                _ingest(_evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents))
+                _ingest(_evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, min_move_to_fee_ratio=min_move_to_fee_ratio, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents))
 
         if candidates:
             # Two sorts: the naive per-contract rule and the new total_ev
@@ -1065,23 +1204,20 @@ def compute_best_trades(
                 }
                 for r in rejections
             ]
-            gross_pick_label = compute_display_label(
-                market_ticker=gross_pick["market_ticker"],
-                side=gross_pick["side"],
-                market_type=gross_pick["market_type"],
-                home_abbr=home_abbr,
-                away_abbr=away_abbr,
-            )
             # Decision log payload — enriched candidates (sorted best-first by
             # total_ev) plus rejections. Stashed on the cached trade dict so
             # /buy can log the full picture at tap time without recomputing.
+            # gross_pick_* carry the raw ticker-perspective fields so the
+            # formatter's _header_label can render "WSH YES" style names
+            # consistent with the candidate block.
             best_trade["decision_log"] = {
                 "event": d.event,
                 "alpha": alpha,
                 "picked_ticker": net_pick["market_ticker"],
                 "picked_side": net_pick["side"],
                 "fee_adjusted": fee_adjusted,
-                "gross_pick_label": gross_pick_label,
+                "gross_pick_market_label": gross_pick.get("market_label"),
+                "gross_pick_market_type": gross_pick.get("market_type"),
                 "gross_pick_side": gross_pick["side"],
                 "candidates": decision_candidates,
                 "rejected": decision_rejections,
@@ -1159,6 +1295,50 @@ def compute_best_trades(
 # ---------------------------------------------------------------------------
 
 
+def _header_label(item: dict) -> str:
+    """Build a ticker-perspective header label for one candidate or
+    rejection: `{raw market label} {SIDE}`. Two same-outcome candidates
+    hitting different tickers (e.g. YES on WSH vs NO on PIT, both
+    "WSH wins") stay visually distinct because the ticker-team + side
+    pair is unique per (ticker, side).
+
+        moneyline:   "ML WSH"      + "YES" → "WSH YES"
+        spread:      "SPR SEA -1.5"+ "NO"  → "SEA -1.5 NO"
+        over_under:  "O/U 7.5"     + "YES" → "Over 7.5 YES"
+
+    This intentionally does NOT use `display_label` (the frontend's
+    semantic form that flips NO onto the opposing team) — two candidates
+    betting the same outcome would then collide on the header.
+    """
+    mt = item.get("market_type") or ""
+    market_label = item.get("market_label") or ""
+    side = item.get("side") or ""
+
+    if mt == "over_under":
+        line_str = market_label[4:].strip() if market_label.startswith("O/U ") else market_label
+        if side == "YES":
+            base = f"Over {line_str}" if line_str else "Over"
+        elif side == "NO":
+            base = f"Under {line_str}" if line_str else "Under"
+        else:
+            base = market_label or "O/U"
+    elif mt == "moneyline":
+        # "ML WSH" → "WSH"
+        base = market_label[3:] if market_label.startswith("ML ") else market_label
+    elif mt == "spread":
+        # "SPR SEA -1.5" → "SEA -1.5"
+        base = market_label[4:] if market_label.startswith("SPR ") else market_label
+    else:
+        base = (
+            market_label
+            or item.get("display_label")
+            or item.get("market_ticker")
+            or "?"
+        )
+
+    return f"{base} {side}".strip() if side else base
+
+
 def format_decision_log(decision: dict) -> str:
     """Render the picker's per-event decision record as a single multi-line
     block. Designed so `grep "DECISION <EVENT>"` returns the full block for
@@ -1177,11 +1357,10 @@ def format_decision_log(decision: dict) -> str:
     winner_ev = candidates[0]["total_ev"] if candidates else None
 
     def _cand_line(c: dict, is_winner: bool) -> list[str]:
-        # display_label already encodes the side semantics (NO-side ML flips
-        # to the opposing team, O/U flips Over↔Under, spread flips ±line),
-        # so it's self-describing — don't re-append `side` or prefix the
-        # market_type tag.
-        label = c.get("display_label") or c.get("market_label") or c["market_ticker"]
+        # Header uses the ticker-perspective label (not the flipped
+        # display_label) + side so same-outcome candidates on different
+        # tickers don't collide.
+        label_with_side = _header_label(c)
         head = "PICKED" if is_winner else "REJECTED"
 
         est_qty = int(c.get("estimated_fill_qty", 0) or 0)
@@ -1209,7 +1388,7 @@ def format_decision_log(decision: dict) -> str:
         gross_rank = c.get("gross_ev_rank")
 
         lines = [
-            f"│ {head} → {label}",
+            f"│ {head} → {label_with_side}",
             f"│   entry={c['entry_price']:.2f}  target={c['sell_target']:.2f}  "
             f"move={int(c.get('move_cents', 0))}¢  alpha={alpha:.2f}",
             f"│   predicted_delta={c.get('predicted_delta', 0):+.4f}  "
@@ -1242,16 +1421,10 @@ def format_decision_log(decision: dict) -> str:
         return lines
 
     def _rej_line(r: dict) -> list[str]:
-        # display_label is side-aware where possible; falls back to the raw
-        # market label when the guard tripped before a side was chosen.
-        label = (
-            r.get("display_label")
-            or r.get("market_label")
-            or r.get("market_ticker")
-            or "?"
-        )
+        # _header_label omits the side suffix when side is None (early
+        # guards like stale_market trip before a side is chosen).
         return [
-            f"│ SKIPPED → {label}",
+            f"│ SKIPPED → {_header_label(r)}",
             f"│   reason: {r.get('rejection_reason', '?')} "
             f"({r.get('rejection_detail', '')})",
         ]
@@ -1275,11 +1448,15 @@ def format_decision_log(decision: dict) -> str:
 
     fee_adjusted = decision.get("fee_adjusted")
     if fee_adjusted:
-        # gross_pick_label is side-aware (compute_display_label), so don't
-        # re-append gross_pick_side — would yield "DET wins YES".
+        # Same ticker-perspective label scheme as the candidate block.
+        gross_pick_display = _header_label({
+            "market_type": decision.get("gross_pick_market_type"),
+            "market_label": decision.get("gross_pick_market_label"),
+            "side": decision.get("gross_pick_side"),
+        })
         fee_line = (
             f"  fee_adjusted: YES — gross ranking would have picked "
-            f"{decision.get('gross_pick_label', '?')}"
+            f"{gross_pick_display}"
         )
     else:
         fee_line = "  fee_adjusted: NO (gross and net rankings agree on #1)"
