@@ -442,6 +442,8 @@ def _empty_trade(event: str, bet_size: int) -> dict:
         "sell_target": 0,
         "spread": 0,
         "ev_per_contract": 0,
+        "total_ev": 0,
+        "estimated_fill_qty": 0,
         "quantity": bet_size,
         "estimated_cost": 0,
         "estimated_profit": 0,
@@ -460,6 +462,8 @@ def _evaluate_market(
     min_move_cents: int = 0,
     stale_market_seconds: int = 0,
     exit_slippage_cents: int = 0,
+    max_dollars: float = 0.0,
+    max_slippage_cents: float = 0.0,
 ) -> dict | None:
     """Evaluate a single market for one event. Returns trade info or None."""
     prefix = f"eval[{event or '-'}][{market.label}]"
@@ -627,12 +631,40 @@ def _evaluate_market(
         (best["sell_target"] - best["entry_price"]) * bet_size - entry_fee - exit_fee
     )
 
+    # total_ev is the new primary ranking key: fee-aware expected dollar
+    # profit scaled to the quantity actually fillable at this user's
+    # slippage + budget settings. A per-contract EV of 2.8¢ on a market
+    # with 625 fillable contracts now beats a 3.2¢ EV on one with 40.
+    # est_qty == 0 means no depth snapshot was available — treat the
+    # candidate as not rankable so it falls to the bottom of the sort.
+    est_qty = 0
+    if max_dollars > 0 and max_slippage_cents > 0:
+        try:
+            est_qty = kalshi.estimate_fill_qty(
+                market.ticker, best["side"],
+                max_dollars=float(max_dollars),
+                max_slippage_cents=float(max_slippage_cents),
+            )
+        except Exception as e:
+            logger.debug(f"{prefix} estimate_fill_qty failed: {e}")
+            est_qty = 0
+    if est_qty > 0:
+        entry_fee_at_qty = taker_fee(contracts=est_qty, price_dollars=best["entry_price"])
+        exit_fee_at_qty = maker_fee(contracts=est_qty, price_dollars=best["sell_target"])
+        total_ev = (
+            (best["sell_target"] - best["entry_price"]) * est_qty
+            - entry_fee_at_qty - exit_fee_at_qty
+        )
+    else:
+        total_ev = 0.0
+
     picked_label = yes_label if best["side"] == "YES" else no_label
     logger.info(
         f"{prefix} → trade {picked_label} ({best['side']}) "
         f"entry={best['entry_price']} target={best['sell_target']} "
         f"ev={best['ev_per_contract']:+.4f} "
         f"net_ev={net_expected_profit:+.4f} "
+        f"total_ev={total_ev:+.4f} est_qty={est_qty} "
         f"fees={entry_fee:.3f}+{exit_fee:.3f}"
     )
 
@@ -646,6 +678,8 @@ def _evaluate_market(
         "sell_target": best["sell_target"],
         "spread": best["spread"],
         "ev_per_contract": best["ev_per_contract"],
+        "total_ev": round(total_ev, 4),
+        "estimated_fill_qty": est_qty,
         "quantity": bet_size,
         "estimated_cost": round(best["entry_price"] * bet_size, 2),
         "estimated_profit": round(best["profit_per"] * bet_size, 2),
@@ -691,6 +725,13 @@ def compute_best_trades(
     ))
     exit_slippage_cents = int(settings.get(
         "exit_slippage_cents", DEFAULT_SETTINGS["exit_slippage_cents"],
+    ))
+    # Feed the total_ev probe: max_dollars sets the budget ceiling on the
+    # estimated fill, max_slippage_cents sets how deep into the ask stack
+    # we're willing to walk. Both live in DEFAULT_SETTINGS.
+    max_dollars = float(settings.get("max_dollars", DEFAULT_SETTINGS["max_dollars"]))
+    max_slippage_cents = float(settings.get(
+        "max_slippage_cents", DEFAULT_SETTINGS["max_slippage_cents"],
     ))
 
     with _market_lock:
@@ -781,7 +822,7 @@ def compute_best_trades(
         # --- Moneyline candidates ---
         if not (blowout_filter and is_blowout):
             for ml in ml_markets:
-                trade = _evaluate_market(ml, d.delta, alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents)
+                trade = _evaluate_market(ml, d.delta, alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents)
                 if trade:
                     candidates.append(trade)
 
@@ -789,7 +830,7 @@ def compute_best_trades(
         if ou_market:
             ou_delta_data = d.over_under.get(str(ou_market.line))
             if ou_delta_data:
-                trade = _evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents)
+                trade = _evaluate_market(ou_market, ou_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents)
                 if trade:
                     candidates.append(trade)
 
@@ -797,19 +838,21 @@ def compute_best_trades(
         for sp_market in sp_markets_picked:
             sp_delta_data = d.spread.get(str(sp_market.line))
             if sp_delta_data:
-                trade = _evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents)
+                trade = _evaluate_market(sp_market, sp_delta_data["delta"], alpha, bet_size, event=d.event, home_abbr=home_abbr, away_abbr=away_abbr, min_move_cents=min_move_cents, stale_market_seconds=stale_market_seconds, exit_slippage_cents=exit_slippage_cents, max_dollars=max_dollars, max_slippage_cents=max_slippage_cents)
                 if trade:
                     candidates.append(trade)
 
         if candidates:
-            # Two sorts: the old gross-EV rule and the new net-EV rule. We pick
-            # by net EV but remember the gross pick so we can flag trades where
-            # fee-awareness changed the choice.
+            # Two sorts: the naive per-contract rule and the new total_ev
+            # rule. We pick by total_ev (fee-aware dollars scaled to the
+            # quantity actually fillable within user slippage+budget) but
+            # remember the per-contract pick so we can flag trades where
+            # liquidity-awareness changed the choice.
             gross_sorted = sorted(
                 candidates, key=lambda t: t["ev_per_contract"], reverse=True
             )
             net_sorted = sorted(
-                candidates, key=lambda t: t["net_expected_profit"], reverse=True
+                candidates, key=lambda t: t["total_ev"], reverse=True
             )
             gross_pick = gross_sorted[0]
             net_pick = net_sorted[0]
@@ -820,7 +863,7 @@ def compute_best_trades(
 
             best_trade = dict(net_pick)
             best_trade["event"] = d.event
-            best_trade["active"] = best_trade["net_expected_profit"] > 0
+            best_trade["active"] = best_trade["total_ev"] > 0
             best_trade["fee_adjusted"] = fee_adjusted
             best_trade["gross_pick_ticker"] = (
                 gross_pick["market_ticker"] if fee_adjusted else None
@@ -838,12 +881,13 @@ def compute_best_trades(
                 logger.info(
                     f"compute_best_trades game={game_id} event={d.event} "
                     f"fee_adjusted=True: net_pick={net_pick['market_ticker']}/{net_pick['side']} "
-                    f"(net_ev={net_pick['net_expected_profit']:+.4f}) "
+                    f"(total_ev={net_pick['total_ev']:+.4f} "
+                    f"est_qty={net_pick['estimated_fill_qty']}) "
                     f"was gross_pick={gross_pick['market_ticker']}/{gross_pick['side']} "
                     f"(ev={gross_pick['ev_per_contract']:+.4f}, "
-                    f"net_ev={gross_pick['net_expected_profit']:+.4f})"
+                    f"total_ev={gross_pick['total_ev']:+.4f})"
                 )
-            # all_trades is the full positive-net-EV basket. Frontend ignores
+            # all_trades is the full positive-total_ev basket. Frontend ignores
             # it in single-market mode; backend reads it in multi mode.
             best_trade["all_trades"] = [
                 {
@@ -860,7 +904,7 @@ def compute_best_trades(
                     ),
                 }
                 for c in candidates
-                if c["net_expected_profit"] > 0
+                if c["total_ev"] > 0
             ]
             result[d.event] = best_trade
 
@@ -881,6 +925,8 @@ def compute_best_trades(
                 f"entry={best_trade['entry_price']:.2f} "
                 f"target={best_trade['sell_target']:.2f} "
                 f"ev={best_trade['ev_per_contract']:+.4f} "
+                f"total_ev={best_trade['total_ev']:+.4f} "
+                f"est_qty={best_trade['estimated_fill_qty']} "
                 f"(candidates={len(candidates)})"
             )
             # -------------------------------------------------------------

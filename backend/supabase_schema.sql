@@ -197,6 +197,19 @@ create table if not exists public.orderbook_snapshots (
   total_ask_depth integer
 );
 
+-- Cross-market snapshot fields. On every trade we now snapshot the
+-- traded market plus every other active contract for the game across
+-- all three market types (moneyline / over_under / spread, both sides).
+-- All rows from the same trade event share trade_id; market_type
+-- distinguishes the contract kind; spread + depth_within_Nc are
+-- pre-aggregated liquidity summaries on the exit (bid) side.
+alter table public.orderbook_snapshots
+  add column if not exists market_type     text,
+  add column if not exists spread          numeric,
+  add column if not exists depth_within_1c integer,
+  add column if not exists depth_within_2c integer,
+  add column if not exists depth_within_3c integer;
+
 create index if not exists ob_snap_trade_idx
   on public.orderbook_snapshots (trade_id)
   where trade_id is not null;

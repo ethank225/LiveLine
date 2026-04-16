@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import uuid
 from datetime import datetime
 
@@ -278,6 +279,121 @@ _registry_lock = threading.Lock()
 # exposure and complicating exit (two resting sells, two timers, etc).
 _active_tickers: set[str] = set()
 _active_tickers_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Cross-market snapshot helper
+# ---------------------------------------------------------------------------
+
+# Inter-ticker throttle for the sibling-snapshot REST loop. MLB markets
+# aren't on `orderbook_delta`, so every sibling fetch hits Kalshi's REST
+# orderbook endpoint — a 150ms gap between tickers keeps us well clear
+# of per-second rate limits without materially delaying the snapshot set.
+_SIBLING_SNAPSHOT_SLEEP_SEC = 0.15
+
+
+def _select_sibling_markets(
+    siblings: list, traded_ticker: str,
+    home_score: int, away_score: int,
+):
+    """Cap cross-market snapshots to the most decision-relevant contracts:
+      - Moneyline: one canonical ticker (prefer the home/non-flipped side).
+      - Over/Under: lines within 2 of the current combined score.
+      - Spread:    lines within 2 of the current run differential.
+
+    The traded ticker is always included (even if it would fall outside
+    the cap) so its opposite-side snapshot still lands in the table.
+    """
+    run_diff = home_score - away_score
+    total = home_score + away_score
+
+    ml = [m for m in siblings if m.market_type == "moneyline"]
+    ou = [m for m in siblings if m.market_type == "over_under"]
+    sp = [m for m in siblings if m.market_type == "spread"]
+
+    ml_pick = [m for m in ml if not getattr(m, "flip", False)][:1] or ml[:1]
+    ou_pick = [
+        m for m in ou
+        if m.line is not None and abs(m.line - total) <= 2
+    ]
+    sp_pick = [
+        m for m in sp
+        if m.line is not None and abs(m.line - run_diff) <= 2
+    ]
+
+    picked = ml_pick + ou_pick + sp_pick
+    if traded_ticker not in {m.ticker for m in picked}:
+        traded_info = next(
+            (m for m in siblings if m.ticker == traded_ticker), None
+        )
+        if traded_info is not None:
+            picked.append(traded_info)
+    return picked
+
+
+def _snapshot_sibling_markets(
+    trade_db_id: str, game_id: int, traded_ticker: str, traded_side: str,
+) -> None:
+    """Snapshot the decision-relevant cross-market contracts for this
+    game (see `_select_sibling_markets`) on both YES and NO sides, plus
+    the opposite side of the traded ticker itself (the traded side is
+    already logged by the caller). One REST call per ticker feeds both
+    side-rows via `get_orderbook_both_sides`. Runs on a daemon thread
+    off the trade hot path; insert failures are logged and swallowed.
+    """
+    try:
+        # Local import to avoid circular dependency at module load
+        # (market_selector imports trader via execute_trade path).
+        from app.market_selector import (
+            _game_markets, _market_lock,
+            _game_scores, _score_lock,
+        )
+        with _market_lock:
+            siblings = list(_game_markets.get(game_id, []))
+        with _score_lock:
+            scores = _game_scores.get(game_id) or (0, 0)
+    except Exception as e:
+        logger.error(f"snapshot_sibling_markets discovery failed: {e}")
+        return
+
+    home_score, away_score = scores
+    picked = _select_sibling_markets(
+        siblings, traded_ticker, home_score, away_score,
+    )
+
+    for idx, info in enumerate(picked):
+        try:
+            both = kalshi.get_orderbook_both_sides(info.ticker, levels=5)
+        except Exception as e:
+            logger.error(
+                f"sibling fetch failed (ticker={info.ticker}): {e}"
+            )
+            both = None
+
+        if both:
+            for side in ("YES", "NO"):
+                # Traded ticker: caller already inserted the traded
+                # side; only fill the opposite side here.
+                if info.ticker == traded_ticker and side == traded_side:
+                    continue
+                book = both.get(side) or {}
+                if not book.get("bids") and not book.get("asks"):
+                    continue
+                try:
+                    db.log_orderbook_snapshot(
+                        trade_db_id, game_id, info.ticker, side, book,
+                        market_type=info.market_type,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"sibling log failed "
+                        f"(ticker={info.ticker} side={side}): {e}"
+                    )
+
+        # Throttle between ticker REST calls only — no sleep after the
+        # final ticker, and the inner YES/NO rows share one fetch.
+        if idx < len(picked) - 1:
+            time.sleep(_SIBLING_SNAPSHOT_SLEEP_SEC)
 
 
 # ---------------------------------------------------------------------------
@@ -710,10 +826,14 @@ class Trade:
 
         self._log_to_db()
 
-        # Depth snapshot for the traded ticker. Records top-5 bid/ask so
-        # post-game analysis can answer "how deep was the book here?"
-        # without replaying the websocket. Fire-and-forget daemon thread
-        # so Supabase latency never blocks the trade path. Skipped when:
+        # Depth snapshot for the traded ticker plus every other active
+        # contract across all three market types for this game. Records
+        # top-5 bid/ask so post-game analysis can answer "how deep was
+        # the book here?" without replaying the websocket, and compares
+        # the traded market against its siblings at the exact same
+        # moment. Fire-and-forget daemon threads so Supabase latency
+        # never blocks the trade path. The traded-ticker snapshot is
+        # skipped when:
         #   - trade_db_id is None (DB insert failed, no FK target), or
         #   - local book is empty (freshly subscribed, no snapshot yet).
         try:
@@ -738,8 +858,24 @@ class Trade:
                             self.trade_db_id, self.game_id,
                             self.market_ticker, self.side, book,
                         ),
+                        kwargs={"market_type": self.market_type},
                         daemon=True,
                     ).start()
+
+                # Cross-market snapshot: every other discovered contract
+                # for this game, both YES and NO — plus the opposite
+                # side of the traded ticker itself (the traded side was
+                # already logged above). Reads are from the in-process
+                # websocket book (microseconds); only the Supabase
+                # insert is off the hot path.
+                threading.Thread(
+                    target=_snapshot_sibling_markets,
+                    args=(
+                        self.trade_db_id, self.game_id,
+                        self.market_ticker, self.side,
+                    ),
+                    daemon=True,
+                ).start()
         except Exception as e:
             logger.error(f"log_orderbook_snapshot dispatch failed: {e}")
 

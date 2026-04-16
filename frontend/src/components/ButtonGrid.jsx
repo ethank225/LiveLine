@@ -16,15 +16,6 @@ export default function ButtonGrid({ gameId, disabled, onBuy }) {
   // the backend's trade cache at the moment the fetch resolved.
   const sseSeenRef = useRef(false)
 
-  // Condense a trades dict into something that prints as one short line.
-  // Lets you eyeball whether HR/2B/1B actually carry distinct values.
-  const summarize = (t) => Object.fromEntries(
-    Object.entries(t || {}).map(([ev, v]) => [
-      ev,
-      v ? `${v.market_type || '?'} ${v.side || '-'} ${v.entry_price}→${v.sell_target} (ev=${v.ev_per_contract})` : null,
-    ]),
-  )
-
   // Own SSE listener for trades events only
   useEffect(() => {
     let cancelled = false
@@ -44,7 +35,6 @@ export default function ButtonGrid({ gameId, disabled, onBuy }) {
           const data = JSON.parse(e.data)
           if (data.trades && typeof data.trades === 'object' && !Array.isArray(data.trades)) {
             sseSeenRef.current = true
-            console.log('ButtonGrid received trades: [SSE]', summarize(data.trades))
             setTrades({ ...data.trades })
           }
         } catch { /* ignore */ }
@@ -71,14 +61,7 @@ export default function ButtonGrid({ gameId, disabled, onBuy }) {
           setMultiMarket(!!data.settings.multi_market)
         }
         if (data.trades && typeof data.trades === 'object') {
-          if (sseSeenRef.current) {
-            console.log(
-              'ButtonGrid received trades: [REST stale — skipping]',
-              summarize(data.trades),
-            )
-            return
-          }
-          console.log('ButtonGrid received trades: [REST]', summarize(data.trades))
+          if (sseSeenRef.current) return
           setTrades({ ...data.trades })
         }
       } catch { /* best effort */ }

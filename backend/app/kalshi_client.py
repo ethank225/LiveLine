@@ -71,6 +71,63 @@ from pykalshi import (
     TimeInForce,
 )
 
+# Schema-drift patches for pykalshi 1.0.4. Kalshi's wire format has
+# drifted from what the installed library expects:
+#
+#  1. Orderbook snapshot keys renamed `yes_dollars`/`no_dollars` →
+#     `yes_dollars_fp`/`no_dollars_fp`. The pydantic model still binds
+#     the old names, so snapshots quietly parse to None and the local
+#     book is never seeded with initial depth.
+#
+#  2. Inner `msg.ts` is now an ISO-8601 string (e.g. "2026-04-15T23:00
+#     :39.86954Z") but `feed._dispatch` does `int(ts)` on it outside
+#     any handler try/except. The ValueError kills the websocket read
+#     loop and forces a reconnect per delta — the original "ValueError
+#     on deltas" symptom that led to the old don't-subscribe rule.
+#
+# We fix both by wrapping `_parse_message`: remap snapshot keys, and
+# strip any non-numeric `ts` so `int(ts)` never sees a bad value.
+# Drop this block once pykalshi ships a compatible release.
+import json as _json
+import pykalshi.feed as _pfeed
+_orig_parse_message = _pfeed._parse_message
+
+
+def _sanitize_payload(data: dict) -> bool:
+    """Mutate `data` in place to bring it in line with pykalshi 1.0.4's
+    parser. Returns True if any change was made."""
+    changed = False
+    msg_type = data.get("type")
+    msg = data.get("msg") if isinstance(data.get("msg"), dict) else None
+    if msg is None:
+        return False
+    if msg_type == "orderbook_snapshot":
+        for old, new in (("yes_dollars_fp", "yes_dollars"),
+                         ("no_dollars_fp", "no_dollars")):
+            if old in msg and new not in msg:
+                msg[new] = msg.pop(old)
+                changed = True
+    ts = msg.get("ts")
+    if ts is not None and not isinstance(ts, (int, float)):
+        # pykalshi.feed._dispatch does `int(ts)` unguarded — strip ISO
+        # strings before they reach it, or the feed crashes.
+        msg.pop("ts", None)
+        changed = True
+    return changed
+
+
+def _parse_message_remapped(raw):
+    try:
+        data = raw if isinstance(raw, dict) else _json.loads(raw)
+        if isinstance(data, dict) and _sanitize_payload(data):
+            return _orig_parse_message(_json.dumps(data))
+    except Exception:
+        pass
+    return _orig_parse_message(raw)
+
+
+_pfeed._parse_message = _parse_message_remapped
+
 
 def _fill_complementary_side(prices: dict) -> dict:
     """YES + NO = $1.00 by construction on Kalshi. When one side is missing
@@ -113,6 +170,15 @@ class KalshiManager:
         # this market. Used by `is_market_stale` to gate trades against dead
         # markets (the no_market_data losing-game pattern from the backtest).
         self._last_tick_ts: dict[str, float] = {}
+        # Fill-qty probe cache. MLB markets don't subscribe to orderbook_delta
+        # (the feed crashes — see `subscribe`), so calculate_position_size
+        # falls through to REST every call. _evaluate_market fires every ~2s
+        # × ~10 candidates × multiple games, which would saturate Kalshi's
+        # rate limiter. 5s TTL keyed by (ticker, side, budget, slippage) caps
+        # load to ~1 REST call per ticker per 5s.
+        self._fill_qty_cache: dict[tuple, tuple[float, int]] = {}
+        self._fill_qty_cache_lock = threading.Lock()
+        self._FILL_QTY_CACHE_TTL = 5.0
         self._connected = False
 
     @property
@@ -283,16 +349,26 @@ class KalshiManager:
             logger.debug(f"Orderbook message error: {e}")
 
     def subscribe(self, market_ticker: str):
-        """Subscribe to ticker price updates for a market.
+        """Subscribe to ticker + orderbook_delta updates for a market.
 
-        NOTE: orderbook_delta is intentionally NOT subscribed — Kalshi's
-        websocket crashes on MLB orderbook messages (empty snapshots,
-        ValueError on deltas).  REST fallback handles orderbook reads
-        for position sizing.
+        orderbook_delta seeds `_books[market_ticker]` with full depth so
+        sizing / exit-liquidity / depth probes can read the local book
+        in microseconds instead of paying a REST round trip. The snapshot
+        schema-drift patch at the top of this module handles the
+        `yes_dollars_fp`/`no_dollars_fp` rename that previously left
+        MLB books empty.
         """
         if not self.feed or market_ticker in self._subscribed:
             return
         self.feed.subscribe("ticker", market_ticker=market_ticker)
+        try:
+            self.feed.subscribe("orderbook_delta", market_ticker=market_ticker)
+        except Exception as e:
+            # Don't hard-fail if the orderbook stream rejects a single
+            # ticker — REST paths still work for sizing/exits.
+            logger.warning(
+                f"orderbook_delta subscribe failed for {market_ticker}: {e}"
+            )
         self._subscribed.add(market_ticker)
         # Seed the liveness clock so `is_market_stale` doesn't block trades
         # on a freshly-subscribed ticker before the first real tick lands.
@@ -341,30 +417,29 @@ class KalshiManager:
     def get_orderbook_snapshot(
         self, ticker: str, side: str, levels: int = 5,
     ) -> dict:
-        """Read top-N bid/ask levels from the local websocket-maintained
-        orderbook, in the trade's side-units.
+        """Read top-N bid/ask levels for a ticker, in the trade's side-units.
 
         Bids = resting orders you'd sell into at exit. YES trades read
-        `book.yes` directly; NO trades read `book.no`. Sorted desc.
+        same-side bids; NO trades read NO bids. Sorted desc.
 
         Asks = resting orders you cross to enter. Opposite-side bids
         flipped into traded-side units (`1 - p`). Same convention
-        `_get_ask_levels` and `has_exit_liquidity` use, so a snapshot
-        logged here matches what sizing / exit-liquidity checks saw.
+        `_get_ask_levels` and `has_exit_liquidity` use.
 
-        Returns empty lists + zero depths when the local book hasn't
-        been populated yet (fresh subscription, pre-first-snapshot).
-        Caller decides whether to skip the write.
+        Prefers the local websocket book when populated. Falls back to
+        REST when the orderbook channel isn't subscribed (we only sub
+        `ticker`, not `orderbook_delta`, due to a prior MLB-feed crash).
+        Returns empties when both paths fail.
         """
-        with self._lock:
-            book = self._books.get(ticker)
-        if book is None:
-            return {"bids": [], "asks": [], "total_bid_depth": 0, "total_ask_depth": 0}
+        def _format(bid_raw, ask_raw):
+            return {
+                "bids": sorted(bid_raw, key=lambda x: x[0], reverse=True)[:levels],
+                "asks": sorted(ask_raw, key=lambda x: x[0])[:levels],
+                "total_bid_depth": sum(q for _, q in bid_raw),
+                "total_ask_depth": sum(q for _, q in ask_raw),
+            }
 
-        same_side = book.yes if side == "YES" else book.no
-        opp_side = book.no if side == "YES" else book.yes
-
-        def _parse(d):
+        def _parse_dict(d, flip):
             out = []
             for p_str, q_str in d.items():
                 try:
@@ -373,20 +448,129 @@ class KalshiManager:
                 except (TypeError, ValueError):
                     continue
                 if q > 0:
-                    out.append((p, q))
+                    out.append((round(1.0 - p, 4) if flip else p, q))
             return out
 
-        bid_raw = _parse(same_side)
-        ask_raw = [(round(1.0 - p, 4), q) for p, q in _parse(opp_side)]
+        with self._lock:
+            book = self._books.get(ticker)
 
-        bid_sorted = sorted(bid_raw, key=lambda x: x[0], reverse=True)
-        ask_sorted = sorted(ask_raw, key=lambda x: x[0])
+        if book is not None and book.best_ask is not None:
+            same_side = book.yes if side == "YES" else book.no
+            opp_side = book.no if side == "YES" else book.yes
+            bid_raw = _parse_dict(same_side, flip=False)
+            ask_raw = _parse_dict(opp_side, flip=True)
+            if bid_raw or ask_raw:
+                return _format(bid_raw, ask_raw)
 
+        # REST fallback: local book empty or never populated.
+        if not self.client:
+            return {"bids": [], "asks": [], "total_bid_depth": 0, "total_ask_depth": 0}
+
+        try:
+            market = self.client.get_market(ticker)
+            rest_book = market.get_orderbook(depth=max(levels, 10))
+            ob = rest_book.model_dump().get("orderbook", {}) or {}
+        except Exception as e:
+            logger.debug(f"REST orderbook fetch failed for {ticker}: {e}")
+            return {"bids": [], "asks": [], "total_bid_depth": 0, "total_ask_depth": 0}
+
+        same_raw = ob.get("yes_dollars" if side == "YES" else "no_dollars") or []
+        opp_raw = ob.get("no_dollars" if side == "YES" else "yes_dollars") or []
+
+        def _parse_list(rows, flip):
+            out = []
+            for p_str, q_str in rows:
+                try:
+                    p = float(p_str)
+                    q = int(float(q_str))
+                except (TypeError, ValueError):
+                    continue
+                if q > 0:
+                    out.append((round(1.0 - p, 4) if flip else p, q))
+            return out
+
+        bid_raw = _parse_list(same_raw, flip=False)
+        ask_raw = _parse_list(opp_raw, flip=True)
+        return _format(bid_raw, ask_raw)
+
+    def get_orderbook_both_sides(
+        self, ticker: str, levels: int = 5,
+    ) -> dict:
+        """One-fetch variant of `get_orderbook_snapshot`: returns
+        `{"YES": book, "NO": book}` where each `book` has the same shape
+        `get_orderbook_snapshot` returns. Halves REST pressure when a
+        caller wants both side-views (e.g., cross-market snapshots after
+        a trade — MLB markets aren't on `orderbook_delta`, so every
+        single-side call is its own REST round trip).
+
+        Prefers the local websocket book when populated; otherwise a
+        single `get_orderbook` REST call serves both views.
+        """
+        empty = {
+            "bids": [], "asks": [],
+            "total_bid_depth": 0, "total_ask_depth": 0,
+        }
+
+        def _format(bid_raw, ask_raw):
+            return {
+                "bids": sorted(bid_raw, key=lambda x: x[0], reverse=True)[:levels],
+                "asks": sorted(ask_raw, key=lambda x: x[0])[:levels],
+                "total_bid_depth": sum(q for _, q in bid_raw),
+                "total_ask_depth": sum(q for _, q in ask_raw),
+            }
+
+        def _parse(rows_or_dict, flip):
+            # REST gives list-of-pairs; websocket gives dict. Normalize.
+            items = (
+                rows_or_dict.items()
+                if isinstance(rows_or_dict, dict)
+                else rows_or_dict
+            )
+            out = []
+            for p_str, q_str in items:
+                try:
+                    p = float(p_str)
+                    q = int(float(q_str))
+                except (TypeError, ValueError):
+                    continue
+                if q > 0:
+                    out.append((round(1.0 - p, 4) if flip else p, q))
+            return out
+
+        with self._lock:
+            book = self._books.get(ticker)
+
+        if book is not None and book.best_ask is not None:
+            yes_raw = _parse(book.yes, flip=False)
+            no_raw = _parse(book.no, flip=False)
+            yes_opp = _parse(book.no, flip=True)
+            no_opp = _parse(book.yes, flip=True)
+            if yes_raw or no_raw:
+                return {
+                    "YES": _format(yes_raw, yes_opp),
+                    "NO": _format(no_raw, no_opp),
+                }
+
+        if not self.client:
+            return {"YES": dict(empty), "NO": dict(empty)}
+
+        try:
+            market = self.client.get_market(ticker)
+            rest_book = market.get_orderbook(depth=max(levels, 10))
+            ob = rest_book.model_dump().get("orderbook", {}) or {}
+        except Exception as e:
+            logger.debug(f"REST orderbook fetch failed for {ticker}: {e}")
+            return {"YES": dict(empty), "NO": dict(empty)}
+
+        yes_rows = ob.get("yes_dollars") or []
+        no_rows = ob.get("no_dollars") or []
+        yes_same = _parse(yes_rows, flip=False)
+        no_same = _parse(no_rows, flip=False)
+        yes_opp = _parse(no_rows, flip=True)
+        no_opp = _parse(yes_rows, flip=True)
         return {
-            "bids": bid_sorted[:levels],
-            "asks": ask_sorted[:levels],
-            "total_bid_depth": sum(q for _, q in bid_raw),
-            "total_ask_depth": sum(q for _, q in ask_raw),
+            "YES": _format(yes_same, yes_opp),
+            "NO": _format(no_same, no_opp),
         }
 
     def has_exit_liquidity(
@@ -618,6 +802,67 @@ class KalshiManager:
             "budget_limited": budget_limited,
             "source": source,
         }
+
+    def estimate_fill_qty(
+        self,
+        ticker: str,
+        side: str,
+        max_dollars: float,
+        max_slippage_cents: float,
+    ) -> int:
+        """Contracts that would fill at up to `max_slippage_cents` above
+        the best ask within a `max_dollars` budget. Same math as
+        `calculate_position_size`.
+
+        Fast path: when the local websocket book is populated (seeded by
+        `subscribe()`'s orderbook_delta subscription), read it directly —
+        microseconds, no network, no cache. Slow path: fall back to REST
+        via a 5s TTL cache keyed by (ticker, side, budget, slippage) so
+        a freshly-subscribed ticker whose snapshot hasn't landed yet
+        doesn't flood the REST endpoint during the warm-up window.
+
+        Returns 0 when both paths yield no depth; the caller treats that
+        as 'not rankable' and filters the candidate out.
+        """
+        with self._lock:
+            book = self._books.get(ticker)
+            has_local = book is not None and book.best_ask is not None
+
+        if has_local:
+            sized = self.calculate_position_size(
+                ticker, side,
+                max_dollars=max_dollars,
+                max_slippage_cents=max_slippage_cents,
+            )
+            logger.debug(
+                f"estimate_fill_qty: local book for {ticker} "
+                f"({side}, qty={sized.get('contracts', 0)})"
+            )
+            return int(sized.get("contracts") or 0)
+
+        key = (
+            ticker, side,
+            round(float(max_dollars), 2),
+            round(float(max_slippage_cents), 2),
+        )
+        now = time.time()
+        with self._fill_qty_cache_lock:
+            hit = self._fill_qty_cache.get(key)
+            if hit and now - hit[0] < self._FILL_QTY_CACHE_TTL:
+                return hit[1]
+        sized = self.calculate_position_size(
+            ticker, side,
+            max_dollars=max_dollars,
+            max_slippage_cents=max_slippage_cents,
+        )
+        contracts = int(sized.get("contracts") or 0)
+        logger.info(
+            f"estimate_fill_qty: REST fallback for {ticker} "
+            f"({side}, qty={contracts})"
+        )
+        with self._fill_qty_cache_lock:
+            self._fill_qty_cache[key] = (now, contracts)
+        return contracts
 
     # ------------------------------------------------------------------
     # Order execution

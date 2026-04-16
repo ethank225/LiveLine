@@ -1,4 +1,39 @@
+import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
+import { api } from '../api'
+
+// Polls /settings so the dry-run cue reflects the toggle even when the
+// user flips it from another tab. Light (30s, once on mount) and
+// silently best-effort — auth or network errors just leave the cue off.
+function useDryRun(intervalMs = 30000) {
+  const [dryRun, setDryRun] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      try {
+        const s = await api.getSettings()
+        if (!cancelled) setDryRun(!!s?.dry_run)
+      } catch { /* best effort */ }
+    }
+    load()
+    const id = setInterval(load, intervalMs)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [intervalMs])
+  return dryRun
+}
+
+function DryRunPill() {
+  return (
+    <span
+      className="text-[10px] font-bold uppercase tracking-wider
+                 text-amber-300 bg-amber-500/15 border border-amber-500/40
+                 px-2 py-0.5 rounded-full"
+      title="Dry run — trades are simulated, no real money"
+    >
+      Dry run
+    </span>
+  )
+}
 
 function SettingsGearIcon({ size = 20 }) {
   return (
@@ -11,9 +46,13 @@ function SettingsGearIcon({ size = 20 }) {
 
 // GameSelector header: logo, balance, settings gear
 export function GameSelectorHeader({ balance }) {
+  const dryRun = useDryRun()
   return (
     <div className="flex items-center justify-between px-4 pt-3 pb-2">
-      <span className="text-lg font-bold">LiveLine</span>
+      <div className="flex items-center gap-2">
+        <span className="text-lg font-bold">LiveLine</span>
+        {dryRun && <DryRunPill />}
+      </div>
       <div className="flex items-center gap-3">
         {balance !== null && balance !== undefined && (
           <span className="text-sm font-mono text-slate-300">${balance.toFixed(2)}</span>
@@ -28,6 +67,7 @@ export function GameSelectorHeader({ balance }) {
 
 // Trading header: back arrow, logo, balance, settings gear
 export function TradingHeader({ balance }) {
+  const dryRun = useDryRun()
   return (
     <div className="flex items-center justify-between px-4 pt-3 pb-2">
       <div className="flex items-center gap-3">
@@ -35,6 +75,7 @@ export function TradingHeader({ balance }) {
           &#8592;
         </Link>
         <span className="text-lg font-bold">LiveLine</span>
+        {dryRun && <DryRunPill />}
       </div>
       <div className="flex items-center gap-3">
         {balance !== null && balance !== undefined && (

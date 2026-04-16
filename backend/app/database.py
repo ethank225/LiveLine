@@ -436,6 +436,7 @@ def log_orderbook_snapshot(
     market_ticker: str,
     side: str,
     book: dict,
+    market_type: str | None = None,
 ) -> None:
     """Flatten a top-N `book` dict from `kalshi.get_orderbook_snapshot`
     into a single `orderbook_snapshots` row keyed by `trade_id`.
@@ -443,25 +444,41 @@ def log_orderbook_snapshot(
     `book` shape: {"bids": [(price, qty), ...], "asks": [...],
     "total_bid_depth": int, "total_ask_depth": int}. Levels beyond what
     the book actually had are left NULL — the schema allows it.
+
+    `spread` = best_ask − best_bid in `side`-units. `depth_within_Nc` is
+    cumulative bid-qty within N cents of the best bid — the exit-side
+    depth that drives has_exit_liquidity. NULL when the book has no bids.
     """
     client = _get_client()
     if client is None or not trade_id:
         return
     try:
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
         row: dict = {
             "trade_id": trade_id,
             "game_id": int(game_id),
             "market_ticker": market_ticker,
             "side": side,
+            "market_type": market_type,
             "total_bid_depth": int(book.get("total_bid_depth") or 0),
             "total_ask_depth": int(book.get("total_ask_depth") or 0),
         }
-        for i, (price, qty) in enumerate(book.get("bids") or [], start=1):
+        if bids and asks:
+            row["spread"] = round(float(asks[0][0]) - float(bids[0][0]), 4)
+        if bids:
+            best_bid = float(bids[0][0])
+            for cents in (1, 2, 3):
+                threshold = best_bid - cents / 100.0
+                row[f"depth_within_{cents}c"] = int(sum(
+                    int(q) for p, q in bids if float(p) >= threshold
+                ))
+        for i, (price, qty) in enumerate(bids, start=1):
             if i > 5:
                 break
             row[f"bid_{i}_price"] = float(price)
             row[f"bid_{i}_qty"] = int(qty)
-        for i, (price, qty) in enumerate(book.get("asks") or [], start=1):
+        for i, (price, qty) in enumerate(asks, start=1):
             if i > 5:
                 break
             row[f"ask_{i}_price"] = float(price)
