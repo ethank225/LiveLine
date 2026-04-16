@@ -118,6 +118,100 @@ class TestNoSessionMergesSavedPrefs:
         assert result["max_dollars"] >= 1.0
 
 
+class TestSaveUserSettingsUpsert:
+    """Guards the UPDATE → UPSERT fix in `db.save_user_settings`.
+
+    The original bug: `.update({"settings": ...}).eq("id", user_id)` affects
+    0 rows when the `public.users` row doesn't exist (legacy users who
+    pre-date the `handle_new_auth_user` trigger). The save silently no-ops,
+    `get_user_settings` returns `{}`, and every new Session seeds from
+    `DEFAULT_SETTINGS` — surfacing as "I toggled a setting but the backend
+    ignored it." These tests pin the call shape so a future revert back to
+    UPDATE would fail loudly at test time."""
+
+    def _install_fake_client(self, monkeypatch):
+        """Mock the Supabase client's chained `.table().upsert().execute()`
+        sequence with call-recording fakes so tests can assert exactly how
+        `save_user_settings` interacts with the SDK."""
+        from unittest.mock import MagicMock
+        from app import database as db
+
+        table_mock = MagicMock()
+        # `execute()` on the upsert chain returns an object with `.data`;
+        # upsert normally echoes the row back, which our logging inspects.
+        table_mock.upsert.return_value.execute.return_value = MagicMock(
+            data=[{"id": "user-upsert", "settings": {}}]
+        )
+        client_mock = MagicMock()
+        client_mock.table.return_value = table_mock
+
+        monkeypatch.setattr(db, "_get_client", lambda: client_mock)
+        return client_mock, table_mock
+
+    def test_uses_upsert_not_update(self, monkeypatch):
+        """Primary regression guard: a revert to `.update(...).eq(...)`
+        would not exercise `.upsert(...)` and this assertion would fail."""
+        from app import database as db
+
+        _, table_mock = self._install_fake_client(monkeypatch)
+
+        db.save_user_settings("user-upsert", {"use_undo_window": False})
+
+        table_mock.upsert.assert_called_once()
+        # `.update()` must NOT have been called — otherwise the legacy
+        # silent-0-row path is back.
+        assert not table_mock.update.called, (
+            "save_user_settings reverted to UPDATE — legacy users "
+            "without a public.users row will silently lose their saves"
+        )
+
+    def test_upsert_payload_and_conflict_key(self, monkeypatch):
+        """The `public.users.id` PK must be in the payload and the
+        conflict target must be `id`. Missing either breaks the upsert."""
+        from app import database as db
+
+        _, table_mock = self._install_fake_client(monkeypatch)
+
+        db.save_user_settings("user-upsert", {"alpha": 0.65, "dry_run": False})
+
+        args, kwargs = table_mock.upsert.call_args
+        payload = args[0] if args else kwargs.get("json") or kwargs
+        # Row body must carry both the PK and the settings jsonb.
+        assert payload.get("id") == "user-upsert", (
+            "upsert payload missing id — UPSERT would insert with a null "
+            "PK and fail the FK to auth.users"
+        )
+        assert payload.get("settings") == {"alpha": 0.65, "dry_run": False}
+        # on_conflict tells Supabase which unique constraint to merge on.
+        assert kwargs.get("on_conflict") == "id", (
+            f"expected on_conflict='id', got kwargs={kwargs}"
+        )
+
+    def test_no_client_is_a_silent_noop(self, monkeypatch):
+        """`database.py`'s never-raise contract: if the service client
+        isn't configured, save_user_settings returns without raising and
+        without hitting any fake call path."""
+        from app import database as db
+
+        monkeypatch.setattr(db, "_get_client", lambda: None)
+
+        # Must not raise — the endpoint handler calls this in a
+        # fire-and-forget thread; an exception here would abort the
+        # response path the user already got back.
+        db.save_user_settings("user-upsert", {"alpha": 0.65})
+
+    def test_empty_user_id_is_a_silent_noop(self, monkeypatch):
+        """Second never-raise path: empty user_id never reaches the SDK
+        (which would error on `.eq("id", "")` or `.upsert({"id": ""})`)."""
+        from app import database as db
+
+        _, table_mock = self._install_fake_client(monkeypatch)
+
+        db.save_user_settings("", {"alpha": 0.65})
+
+        assert not table_mock.upsert.called
+
+
 class TestSessionBranchUnchanged:
     """When the user HAS an active session, the saved_prefs arg must not
     matter — session.settings is already seeded from DB at creation and

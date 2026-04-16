@@ -260,13 +260,29 @@ def get_user_settings(user_id: str) -> dict:
 
 def save_user_settings(user_id: str, settings: dict) -> None:
     """Overwrite the user's settings jsonb. Caller is responsible for
-    whitelisting fields — this helper just persists whatever it's given."""
+    whitelisting fields — this helper just persists whatever it's given.
+
+    Uses UPSERT rather than UPDATE so a missing `public.users` row is
+    created on first save. The `handle_new_auth_user` trigger populates
+    new rows on auth.users insert, but legacy users who signed up before
+    the trigger existed have no public.users row. With plain UPDATE the
+    save silently affects 0 rows and every subsequent session seeds from
+    DEFAULT_SETTINGS — which surfaces as "I toggled use_undo_window off
+    but the undo popup still appears" and similar desyncs."""
     client = _get_client()
     if client is None or not user_id:
         return
     try:
-        client.table("users").update({"settings": settings}).eq("id", user_id).execute()
-        logger.info(f"save_user_settings: user={user_id} keys={list(settings.keys())}")
+        resp = (
+            client.table("users")
+            .upsert({"id": user_id, "settings": settings}, on_conflict="id")
+            .execute()
+        )
+        n_rows = len(getattr(resp, "data", None) or [])
+        logger.info(
+            f"save_user_settings: user={user_id} rows={n_rows} "
+            f"keys={list(settings.keys())}"
+        )
     except Exception as e:
         logger.error(f"save_user_settings failed (user={user_id}): {e}")
 

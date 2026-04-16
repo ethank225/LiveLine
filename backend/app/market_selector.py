@@ -460,6 +460,174 @@ def discover_markets(
     return infos
 
 
+def refresh_markets(
+    game_id: int, home_abbr: str, away_abbr: str,
+) -> list[str]:
+    """Re-query Kalshi and subscribe any new tickers listed since the
+    initial `discover_markets` for this game.
+
+    Kalshi adds spread + O/U ladder rungs as the game state evolves —
+    a game that opens with spread tickers for lines 0.5/1.5/2.5 will
+    often have 3.5/4.5 added once the score starts moving. `discover_
+    markets` short-circuits after the first call per game_id, so without
+    a periodic refresh the picker is frozen on the initial ticker set
+    and `pick_spread_line` pins on the tightest available line once the
+    margin exceeds what we know about. Called every ~10s from the MLB
+    poll loop.
+
+    Does NOT remove tickers that are no longer in Kalshi's listing —
+    near-resolution markets sometimes drop off the generic listing
+    endpoint while still being tradeable, and an already-subscribed
+    ticker is cheap to keep watching.
+
+    Returns the list of ticker strings newly added to the watch set
+    (empty on no-op / errors / not-yet-discovered).
+    """
+    if not kalshi.is_connected:
+        return []
+
+    # If initial discovery hasn't happened yet we have no baseline to
+    # diff against and no team-suffix cached. Caller hits discover_markets
+    # first (via /stream or /trades); this refresh path assumes that.
+    if game_id not in _discovered_games:
+        return []
+
+    with _market_lock:
+        cached = list(_game_markets.get(game_id, []))
+    if not cached:
+        return []
+    existing_tickers = {m.ticker for m in cached}
+
+    # Derive the event suffix from any existing ML ticker — avoids the
+    # expensive `_search_event_ticker` brute-force. ML tickers are
+    # `KXMLBGAME-<SUFFIX>-<TEAM>`; stripping the last segment gives
+    # `KXMLBGAME-<SUFFIX>` which we can feed back into `get_markets`.
+    ml_sample = next(
+        (m for m in cached if m.market_type == "moneyline"), None,
+    )
+    if ml_sample is None:
+        return []
+    event_ticker = ml_sample.ticker.rsplit("-", 1)[0]
+    try:
+        suffix = event_ticker.split("-", 1)[1]
+    except IndexError:
+        return []
+    home = (home_abbr or "").upper()
+    away = (away_abbr or "").upper()
+
+    new_markets: list[MarketInfo] = []
+
+    # Moneyline — stable at 2 tickers; included for completeness so a
+    # mid-game Kalshi re-list doesn't slip through.
+    try:
+        for m in kalshi.get_markets(event_ticker):
+            ticker = m["ticker"]
+            if ticker in existing_tickers:
+                continue
+            ticker_upper = ticker.upper()
+            if ticker_upper.endswith(f"-{home}"):
+                new_markets.append(MarketInfo(
+                    ticker=ticker, market_type="moneyline", line=None,
+                    delta_key="ml", flip=False, label=f"ML {home}",
+                    title=m.get("title", ""),
+                ))
+                kalshi.subscribe(ticker)
+            elif ticker_upper.endswith(f"-{away}"):
+                new_markets.append(MarketInfo(
+                    ticker=ticker, market_type="moneyline", line=None,
+                    delta_key="ml", flip=True, label=f"ML {away}",
+                    title=m.get("title", ""),
+                ))
+                kalshi.subscribe(ticker)
+    except Exception as e:
+        logger.warning(f"refresh_markets({game_id}): ML lookup failed: {e}")
+
+    # O/U — more lines get listed as total runs progresses past the opening range.
+    ou_event = f"KXMLBTOTAL-{suffix}"
+    try:
+        for m in kalshi.get_markets(ou_event):
+            ticker = m["ticker"]
+            if ticker in existing_tickers:
+                continue
+            n_str = ticker.rsplit("-", 1)[-1]
+            try:
+                n = int(n_str)
+            except ValueError:
+                continue
+            line = n - 0.5
+            new_markets.append(MarketInfo(
+                ticker=ticker, market_type="over_under", line=line,
+                delta_key=f"ou_{line}", flip=False, label=f"O/U {line}",
+                title=m.get("title", ""),
+            ))
+            kalshi.subscribe(ticker)
+    except Exception as e:
+        logger.warning(f"refresh_markets({game_id}): O/U lookup failed: {e}")
+
+    # Spread — the main driver for this refresh path. New lines get
+    # added as the score shifts; without them the picker pins on the
+    # tightest pre-game line.
+    sp_event = f"KXMLBSPREAD-{suffix}"
+    try:
+        for m in kalshi.get_markets(sp_event):
+            ticker = m["ticker"]
+            if ticker in existing_tickers:
+                continue
+            mkt_suffix = ticker.rsplit("-", 1)[-1].upper()
+            for abbr, is_away in [(home, False), (away, True)]:
+                if not abbr or not mkt_suffix.startswith(abbr):
+                    continue
+                n_str = mkt_suffix[len(abbr):]
+                try:
+                    n = int(n_str)
+                except ValueError:
+                    continue
+                line = n - 0.5
+                if is_away:
+                    delta_key = f"sp_{-line}"
+                    label = f"SPR {abbr} -{line}"
+                else:
+                    delta_key = f"sp_{line}"
+                    label = f"SPR {abbr} -{line}"
+                new_markets.append(MarketInfo(
+                    ticker=ticker, market_type="spread",
+                    line=line if not is_away else -line,
+                    delta_key=delta_key, flip=is_away,
+                    label=label, title=m.get("title", ""),
+                ))
+                kalshi.subscribe(ticker)
+                break
+    except Exception as e:
+        logger.warning(
+            f"refresh_markets({game_id}): spread lookup failed: {e}"
+        )
+
+    if not new_markets:
+        return []
+
+    new_tickers = [m.ticker for m in new_markets]
+    # Merge under the lock and re-dedupe against the current state in
+    # case a concurrent refresh beat us to some of the tickers.
+    with _market_lock:
+        current = list(_game_markets.get(game_id, []))
+        current_tickers = {m.ticker for m in current}
+        added: list[str] = []
+        for m in new_markets:
+            if m.ticker in current_tickers:
+                continue
+            current.append(m)
+            current_tickers.add(m.ticker)
+            added.append(m.ticker)
+        _game_markets[game_id] = current
+
+    if added:
+        logger.info(
+            f"refresh_markets({game_id}): added {len(added)} new tickers: "
+            f"{added}"
+        )
+    return added
+
+
 # ---------------------------------------------------------------------------
 # Dynamic line selection (delegates to shared app/line_selection.py)
 # ---------------------------------------------------------------------------

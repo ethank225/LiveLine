@@ -1015,6 +1015,20 @@ class Trade:
             for k in sorted(self._settings.keys())
         )
         logger.info(f"{self._log_prefix} SETTINGS {settings_str}")
+        # MLB game state at the moment of the buy (inning, half, outs,
+        # runners, scores). Captured at /buy time and frozen on the
+        # Trade; pairs with the DECISION log so "why we bought" and
+        # "what the game looked like" land next to each other. May be
+        # None if the polling cache was cold and the fresh fetch also
+        # failed — emit an explicit marker rather than silently skipping.
+        if self.game_state:
+            state_str = " ".join(
+                f"{k}={self.game_state[k]}"
+                for k in sorted(self.game_state.keys())
+            )
+            logger.info(f"{self._log_prefix} GAMESTATE {state_str}")
+        else:
+            logger.info(f"{self._log_prefix} GAMESTATE <unavailable>")
 
         if self.use_undo_window:
             self._undo_timer = threading.Timer(UNDO_WINDOW_SECONDS, self._activate)

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 
@@ -30,6 +31,7 @@ from app.market_selector import (
     compute_best_trades,
     discover_markets,
     format_decision_log,
+    refresh_markets,
     get_cached_trades,
     get_cached_trades_age_s,
     notify_sse_game_state,
@@ -370,6 +372,26 @@ async def _poll_mlb_state(game_id: int):
                     "state": current_state,
                     "status": response.get("status"),
                 })
+
+                # Poll-driven ticker refresh. Kalshi adds higher spread /
+                # O/U lines as the game state shifts; without this the
+                # initial discover_markets call's ticker set goes stale
+                # and pick_spread_line pins on the tightest known line.
+                # Best-effort — a single failure here must not break the
+                # poll loop, so everything downstream depends on
+                # _game_deltas / _game_scores being up to date already.
+                try:
+                    await asyncio.to_thread(
+                        refresh_markets,
+                        game_id,
+                        response.get("home_abbreviation") or "",
+                        response.get("away_abbreviation") or "",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"refresh_markets failed for game {game_id}: {e}"
+                    )
+
                 _notify_sse(game_id)
 
             if response.get("status") == "Final":
@@ -635,6 +657,14 @@ async def buy_event(
     Places a buy at ask, a limit sell at the target price, and arms
     a stop loss.
     """
+    # Latency instrumentation. t_received is handler entry (post FastAPI
+    # routing + auth dep); t_before_fire is the last thing before the
+    # Kalshi buy goes over the wire; t_after_fire is when Trade.execute
+    # returns. The prep span captures everything on the critical path
+    # (cache/freshness checks, session fetch, settings dict build,
+    # TradeGroup construction) and the fire span is the Kalshi RTT
+    # plus any post-buy in-thread work (log_trade insert lives here).
+    t_received = time.perf_counter()
     logger.info(f"/buy {game_id} {event} user={user.id}")
     if not kalshi.is_connected:
         raise HTTPException(status_code=503, detail="Kalshi not connected")
@@ -771,7 +801,9 @@ async def buy_event(
             if session is not None:
                 session.add_group(group)
             return group.execute()
+        t_before_fire = time.perf_counter()
         group = await asyncio.to_thread(_fire)
+        t_after_fire = time.perf_counter()
         trades = group.trades
         undo_group_id = group.id
     except KillSwitchArmedError as e:
@@ -779,6 +811,17 @@ async def buy_event(
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Trade failed: {e}")
+
+    # Backend-side latency split. `prep` = handler-entry → just before
+    # the Kalshi buy; `fire` = Kalshi RTT + in-thread post-buy work
+    # (log_trade insert, SELL placement kickoff); `total_backend` = both.
+    # Frontend-to-backend network hop is separate — measure in browser
+    # devtools as the POST's "waiting (TTFB)" time.
+    logger.info(
+        f"[LATENCY] prep={int((t_before_fire - t_received) * 1000)}ms "
+        f"fire={int((t_after_fire - t_before_fire) * 1000)}ms "
+        f"total_backend={int((t_after_fire - t_received) * 1000)}ms"
+    )
 
     # Deferred decision-log emission (see capture comment above). The
     # Kalshi IOC buy has now fired and the initial log_trade insert has

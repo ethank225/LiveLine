@@ -29,6 +29,11 @@ export default function Settings() {
   // kick the debounce timer back into life.
   const lastSaved = useRef({})
   const saveTimer = useRef(null)
+  // Payload queued behind the debounce timer — kept so the unmount
+  // effect can flush it synchronously if the user navigates to Trading
+  // mid-debounce. Without this a "toggle off → game page → buy" in under
+  // 500ms raced past the save and /buy saw stale session settings.
+  const pendingPayload = useRef(null)
 
   // Kill switch local UI state. Two-tap confirm so a misthumb doesn't
   // flatten the whole book; `armed` tracks whether the backend flag is
@@ -107,10 +112,12 @@ export default function Settings() {
       k => settings[k] !== lastSaved.current[k]
     )
     if (changedKeys.length === 0) return
+    const payload = {}
+    changedKeys.forEach(k => { payload[k] = settings[k] })
+    pendingPayload.current = payload
     if (saveTimer.current) clearTimeout(saveTimer.current)
     saveTimer.current = setTimeout(async () => {
-      const payload = {}
-      changedKeys.forEach(k => { payload[k] = settings[k] })
+      pendingPayload.current = null
       try {
         const result = await api.updateSettings(payload)
         // Mirror backend-clamped values back into state so out-of-range
@@ -119,10 +126,24 @@ export default function Settings() {
         AUTO_SAVE_KEYS.forEach(k => { lastSaved.current[k] = result[k] })
       } catch { /* best effort — keep the user's chosen value */ }
     }, AUTO_SAVE_DEBOUNCE_MS)
-    return () => {
-      if (saveTimer.current) clearTimeout(saveTimer.current)
-    }
   }, [settings])
+
+  // Unmount flush. If the user navigated away while a save was still
+  // waiting on the 500ms debounce, fire the PUT now so downstream pages
+  // (Trading / /buy) see the latest settings. Fire-and-forget — we
+  // can't block unmount, but kicking the request off here means it's
+  // in flight before the user taps buy.
+  useEffect(() => () => {
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current)
+      saveTimer.current = null
+    }
+    const payload = pendingPayload.current
+    pendingPayload.current = null
+    if (payload) {
+      api.updateSettings(payload).catch(() => {})
+    }
+  }, [])
 
   const update = (key, value) => {
     setSettings(prev => ({ ...prev, [key]: value }))

@@ -182,7 +182,12 @@ EV = α · |Δ_WE| − spread
 - `α` (alpha) — *target capture*: what fraction of the engine's predicted move the market is expected to actually realize before exit. Calibrated from backtests; default 0.6.
 - `spread` — current bid/ask spread on the traded side of the chosen contract, in dollars.
 
-Only trades where `EV > 0` and the entry → target move clears `min_move_cents` (default 4¢, enough to cover Kalshi round-trip taker + maker fees) make it onto the button grid.
+Only trades where `EV > 0` and the entry → target move clears **both** filters land on the button grid:
+
+- `min_move_cents` (default 4¢) — flat floor; a sanity bound against execution-noise trades.
+- `min_move_to_fee_ratio` (default 2.0×) — price-aware floor; target move must be ≥ N× per-contract round-trip fee (Kalshi fees scale with `p·(1−p)`, so a flat cents threshold over-filters cheap contracts and under-filters expensive ones). Sweep data is in `backend/backtests/reports/ratio_*_sweep_*.csv`.
+
+Candidates that fail either filter are rejected with a machine-readable `rejection_reason` (`min_move` or `fee_ratio`) that surfaces in the per-tap decision log (see [Observability](#observability)).
 
 ### Execution lifecycle
 
@@ -201,6 +206,7 @@ pending ─▶ undo_window ─▶ open ─▶ filled      (sell hit target — p
 - **Clean window (45s)** — if the limit sell hasn't filled by then, it's canceled and the position is IOC-exited at market.
 - **Stop loss (10¢)** — armed on the open position via websocket price ticks.
 - **Session loss limit** — per-session floor (default −$1500). Hitting it arms the kill switch, which flattens every live position for the user and returns 503 on further `/buy` calls until reset.
+- **Sell-placement retry (4 attempts, ~1.5s)** — if the resting-sell POST fails on the first try (transient Kalshi 5xx / network blip), retry up to 3 more times with 500ms spacing before falling through to the panic IOC flatten. Idempotent via stable `client_order_id` so a server-side landing under a network error doesn't rest twice.
 
 ### Multi-market mode
 
@@ -234,6 +240,9 @@ venv/bin/python -m backtests.backtest --date 2026-04-10 --game-id 823482 --trace
 ```bash
 venv/bin/python -m backtests.sweeps.alpha            # optimal α
 venv/bin/python -m backtests.sweeps.alpha_minmove    # (α, min_move_cents) grid
+venv/bin/python -m backtests.sweeps.ratio            # min_move_to_fee_ratio bend-finder
+venv/bin/python -m backtests.sweeps.ratio_2d         # (min_move_cents, ratio) grid — is the flat floor still load-bearing?
+venv/bin/python -m backtests.sweeps.alpha_ratio      # (α, ratio) interaction grid
 venv/bin/python -m backtests.sweeps.offset_fill      # fill rate by entry-timing offset
 venv/bin/python -m backtests.sweeps.analyze_losers   # per-trade classification of worst games
 ```
@@ -295,6 +304,20 @@ All endpoints require a Supabase Bearer JWT except `/health`. SSE passes the JWT
 - **Cached-trade freshness guard** — `/buy` rejects taps against trade entries older than 5 seconds so you can't buy into a book that's already moved.
 - **Supabase failures are non-fatal.** Every DB helper wraps in `try/except` and returns a safe default; a Supabase outage disables logging but not trading.
 - **Auth cache is stale-while-error** — a previously-verified JWT continues to work for up to an hour during a Supabase auth outage, so active sessions don't drop.
+
+---
+
+## Observability
+
+Three log streams that together reconstruct what produced any specific trade. All emit after the Kalshi buy returns — never on the critical path between decision and order.
+
+- **`[LATENCY]`** — per-tap timing split printed from `main.buy_event`. `prep` is handler-entry → just-before-Kalshi, `fire` is Kalshi RTT + in-thread post-buy work (initial DB insert, SELL kickoff), `total_backend` is the sum. Frontend network hop is separate — measure as TTFB in browser devtools.
+
+- **`[DECISION <EVENT>]`** — multi-line block emitted per tap listing every candidate the picker evaluated: the PICKED winner, every REJECTED loser (with per-contract fees, net-after-fees, fee-pct, and gross/net EV ranks), and every SKIPPED ticker (with the guard that tripped: `stale_market`, `no_viable_side`, `min_move`, `fee_ratio`, `exit_liquidity`, `blowout_filter`). Labels use the ticker-perspective convention (`WSH YES`, `PIT NO`, `SEA -1.5 YES`, `Over 7.5 YES`) so two same-outcome candidates on different tickers stay visually distinct. A `fee_adjusted: YES/NO` line flags when gross vs net ranking would disagree on the winner. Format source: `market_selector.format_decision_log`.
+
+- **`[TRADE <EVENT> <trade_id>] SETTINGS`** — one-line snapshot of every `session.settings` key that produced the trade (alpha, min_move_cents, min_move_to_fee_ratio, dry_run, stop_loss_cents, etc.). Emitted right after the BUY fill line so a specific trade can be correlated with its exact config at that instant, independent of whatever the user has toggled since.
+
+`grep "DECISION HR"` surfaces the full evaluation block for one tap; `grep "\[LATENCY\]"` gives you the per-tap backend timing distribution.
 
 ---
 
