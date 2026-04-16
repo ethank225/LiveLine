@@ -34,6 +34,13 @@ def mock_sse(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    """_activate now sleeps between sell-placement retries. Patch it to a
+    no-op so the full-retry test doesn't take 1.5s per case."""
+    monkeypatch.setattr(trader.time, "sleep", lambda _s: None)
+
+
+@pytest.fixture(autouse=True)
 def clean_registries():
     yield
     with _registry_lock:
@@ -81,18 +88,41 @@ def _make_buy_filled_trade(*, dry_run: bool = True, side: str = "YES") -> Trade:
     return t
 
 
-def _install_place_order(monkeypatch, *, gtc_raises: bool, ioc_response: dict | Exception | None):
-    """Install a fake trader._place_order that raises on the GTC sell leg
-    and returns the given response (or raises) on the IOC exit leg.
+def _install_place_order(
+    monkeypatch,
+    *,
+    gtc_raises: bool,
+    ioc_response: dict | Exception | None,
+    gtc_fail_attempts: int | None = None,
+    gtc_success_response: dict | None = None,
+):
+    """Install a fake trader._place_order.
+
+    - `gtc_raises=True` with `gtc_fail_attempts=None`: every GTC call raises
+      (persistent failure → drives _activate through all 4 attempts + IOC).
+    - `gtc_fail_attempts=N`: first N GTC calls raise; the (N+1)th returns
+      `gtc_success_response` (transient failure → retry succeeds).
+    - `gtc_raises=False`: GTC succeeds on attempt 1.
+
+    IOC behavior is unchanged: returns `ioc_response` or raises it.
 
     Returns the call_log list so tests can assert call order / args."""
     call_log: list[dict] = []
+    gtc_attempts = 0
 
     def fake_place(**kwargs):
+        nonlocal gtc_attempts
         call_log.append(kwargs)
         tif = kwargs.get("time_in_force")
-        if tif == "gtc" and gtc_raises:
-            raise RuntimeError("simulated Kalshi sell placement error")
+        if tif == "gtc":
+            gtc_attempts += 1
+            if gtc_fail_attempts is not None:
+                if gtc_attempts <= gtc_fail_attempts:
+                    raise RuntimeError("simulated Kalshi sell placement error")
+                return gtc_success_response or {"order_id": f"gtc-{gtc_attempts}"}
+            if gtc_raises:
+                raise RuntimeError("simulated Kalshi sell placement error")
+            return gtc_success_response or {"order_id": f"gtc-{gtc_attempts}"}
         if tif == "ioc":
             if isinstance(ioc_response, Exception):
                 raise ioc_response
@@ -124,19 +154,42 @@ def _install_fallback_bid(monkeypatch, *, yes_bid: float = 0.55, no_bid: float =
 
 class TestDryRunSellFailFlattens:
     def test_sell_failure_triggers_ioc_exit(self, monkeypatch, mock_sse):
-        """Sell POST raises → IOC exit must fire before _activate returns."""
+        """Persistent sell failure → 4 GTC attempts, then IOC force-exit."""
         t = _make_buy_filled_trade(dry_run=True)
         _install_fallback_bid(monkeypatch, yes_bid=0.55)
         calls = _install_place_order(monkeypatch, gtc_raises=True, ioc_response={})
 
         t._activate()
 
-        # GTC sell was attempted, then IOC force-exit was placed.
-        assert len(calls) == 2
-        assert calls[0]["time_in_force"] == "gtc"
-        assert calls[1]["time_in_force"] == "ioc"
-        assert calls[1]["action"] == "sell"
-        assert calls[1]["quantity"] == t.quantity
+        # 4 GTC attempts (initial + 3 retries) then a single IOC exit.
+        assert len(calls) == 5
+        assert [c["time_in_force"] for c in calls[:4]] == ["gtc"] * 4
+        assert calls[4]["time_in_force"] == "ioc"
+        assert calls[4]["action"] == "sell"
+        assert calls[4]["quantity"] == t.quantity
+
+    def test_transient_sell_failure_recovers(self, monkeypatch, mock_sse):
+        """Transient failure resolves within retries → sell rests, no IOC."""
+        t = _make_buy_filled_trade(dry_run=True)
+        _install_fallback_bid(monkeypatch, yes_bid=0.55)
+        calls = _install_place_order(
+            monkeypatch,
+            gtc_raises=False,
+            ioc_response={},
+            gtc_fail_attempts=2,  # attempts 1 and 2 raise, 3 succeeds
+            gtc_success_response={"order_id": "gtc-resting-ok"},
+        )
+
+        t._activate()
+
+        # 3 GTC calls (2 failures + 1 success), NO IOC exit.
+        assert len(calls) == 3
+        assert all(c["time_in_force"] == "gtc" for c in calls)
+        assert t.status == "open"
+        assert t.sell_order_id == "gtc-resting-ok"
+        assert t._clean_timer is not None
+        # Tidy up the started timer so it doesn't fire during the test run.
+        t._clean_timer.cancel()
 
     def test_trade_resolves_with_populated_pnl(self, monkeypatch, mock_sse):
         """Post-flatten: status=error, exit_price set, realized_pnl computed,

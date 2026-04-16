@@ -1025,30 +1025,38 @@ class Trade:
             self.status = "open"
 
         dry_run = bool(self._settings.get("dry_run", True))
-        try:
-            sell_result = _place_order(
-                market_ticker=self.market_ticker,
-                action="sell",
-                side=self.side,
-                quantity=self.quantity,
-                price=self.sell_target,
-                time_in_force="gtc",
-                dry_run=dry_run,
-                client_order_id=self._coid("s"),
-            )
-            self.sell_order_id = sell_result.get("order_id")
-            if self.sell_order_id:
-                # Index for the websocket fill dispatcher. Unregistered
-                # in _notify_resolved on any terminal transition.
-                with _registry_lock:
-                    _trade_by_sell_order_id[self.sell_order_id] = self
-            logger.info(
-                f"{self._log_prefix} SELL {self.quantity} {self.side} {self._short} "
-                f"@${self.sell_target:.2f} → resting"
-            )
-        except Exception as e:
+
+        # Retry the limit sell up to 3 times on transient failures (network
+        # blip, 5xx, brief rate limit) before falling through to panic IOC.
+        # Stable _coid("s") keeps retries idempotent on Kalshi's side: if an
+        # earlier attempt actually landed server-side despite raising, the
+        # duplicate is rejected instead of resting twice.
+        sell_result = None
+        last_err: Exception | None = None
+        for attempt in range(1, 5):  # 1 initial + 3 retries = max ~1.5s
+            if attempt > 1:
+                time.sleep(0.5)
+            try:
+                sell_result = _place_order(
+                    market_ticker=self.market_ticker,
+                    action="sell",
+                    side=self.side,
+                    quantity=self.quantity,
+                    price=self.sell_target,
+                    time_in_force="gtc",
+                    dry_run=dry_run,
+                    client_order_id=self._coid("s"),
+                )
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning(
+                    f"{self._log_prefix} SELL placement failed (attempt {attempt}/4): {e}"
+                )
+
+        if sell_result is None:
             logger.error(
-                f"{self._log_prefix} SELL placement FAILED: {e} — "
+                f"{self._log_prefix} SELL placement FAILED after 4 attempts: {last_err} — "
                 f"buy filled qty={self.quantity} but sell did not rest; force-flattening"
             )
             with self._lock:
@@ -1078,6 +1086,17 @@ class Trade:
             # Last line of defense in case the IOC flatten also failed.
             self._verify_position_closed(reason="sell placement failed")
             return
+
+        self.sell_order_id = sell_result.get("order_id")
+        if self.sell_order_id:
+            # Index for the websocket fill dispatcher. Unregistered
+            # in _notify_resolved on any terminal transition.
+            with _registry_lock:
+                _trade_by_sell_order_id[self.sell_order_id] = self
+        logger.info(
+            f"{self._log_prefix} SELL {self.quantity} {self.side} {self._short} "
+            f"@${self.sell_target:.2f} → resting"
+        )
 
         self._update_db_status("open")
 
