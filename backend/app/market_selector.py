@@ -1044,6 +1044,27 @@ def compute_best_trades(
                 }
                 for c in net_sorted
             ]
+            # Rejections carry `side=None` for guards that trip before a
+            # side is chosen (stale_market, no_viable_side). For those we
+            # fall back to the raw market label since there's no side to
+            # flip NO-side moneylines into the opposing team.
+            decision_rejections = [
+                {
+                    **r,
+                    "display_label": (
+                        compute_display_label(
+                            market_ticker=r["market_ticker"],
+                            side=r["side"],
+                            market_type=r.get("market_type"),
+                            home_abbr=home_abbr,
+                            away_abbr=away_abbr,
+                        )
+                        if r.get("side")
+                        else (r.get("market_label") or r["market_ticker"])
+                    ),
+                }
+                for r in rejections
+            ]
             gross_pick_label = compute_display_label(
                 market_ticker=gross_pick["market_ticker"],
                 side=gross_pick["side"],
@@ -1063,7 +1084,7 @@ def compute_best_trades(
                 "gross_pick_label": gross_pick_label,
                 "gross_pick_side": gross_pick["side"],
                 "candidates": decision_candidates,
-                "rejected": rejections,
+                "rejected": decision_rejections,
             }
             result[d.event] = best_trade
 
@@ -1092,6 +1113,23 @@ def compute_best_trades(
         else:
             empty = _empty_trade(d.event, bet_size)
             empty["all_trades"] = []
+            empty_rejections = [
+                {
+                    **r,
+                    "display_label": (
+                        compute_display_label(
+                            market_ticker=r["market_ticker"],
+                            side=r["side"],
+                            market_type=r.get("market_type"),
+                            home_abbr=home_abbr,
+                            away_abbr=away_abbr,
+                        )
+                        if r.get("side")
+                        else (r.get("market_label") or r["market_ticker"])
+                    ),
+                }
+                for r in rejections
+            ]
             # Still log why nothing qualified — useful when debugging a
             # silent event (user expects a trade, sees none).
             empty["decision_log"] = {
@@ -1100,7 +1138,7 @@ def compute_best_trades(
                 "picked_ticker": None,
                 "picked_side": None,
                 "candidates": [],
-                "rejected": rejections,
+                "rejected": empty_rejections,
             }
             result[d.event] = empty
 
@@ -1139,10 +1177,11 @@ def format_decision_log(decision: dict) -> str:
     winner_ev = candidates[0]["total_ev"] if candidates else None
 
     def _cand_line(c: dict, is_winner: bool) -> list[str]:
-        # display_label already carries the market-type tag ("ML SEA",
-        # "SPR AZ2", "O/U 13"), so don't prefix market_type again.
+        # display_label already encodes the side semantics (NO-side ML flips
+        # to the opposing team, O/U flips Over↔Under, spread flips ±line),
+        # so it's self-describing — don't re-append `side` or prefix the
+        # market_type tag.
         label = c.get("display_label") or c.get("market_label") or c["market_ticker"]
-        side = c["side"]
         head = "PICKED" if is_winner else "REJECTED"
 
         est_qty = int(c.get("estimated_fill_qty", 0) or 0)
@@ -1170,7 +1209,7 @@ def format_decision_log(decision: dict) -> str:
         gross_rank = c.get("gross_ev_rank")
 
         lines = [
-            f"│ {head} → {label} {side}",
+            f"│ {head} → {label}",
             f"│   entry={c['entry_price']:.2f}  target={c['sell_target']:.2f}  "
             f"move={int(c.get('move_cents', 0))}¢  alpha={alpha:.2f}",
             f"│   predicted_delta={c.get('predicted_delta', 0):+.4f}  "
@@ -1203,10 +1242,16 @@ def format_decision_log(decision: dict) -> str:
         return lines
 
     def _rej_line(r: dict) -> list[str]:
-        label = r.get("market_label") or r.get("market_ticker") or "?"
-        side = r.get("side") or "-"
+        # display_label is side-aware where possible; falls back to the raw
+        # market label when the guard tripped before a side was chosen.
+        label = (
+            r.get("display_label")
+            or r.get("market_label")
+            or r.get("market_ticker")
+            or "?"
+        )
         return [
-            f"│ SKIPPED → {label} {side}",
+            f"│ SKIPPED → {label}",
             f"│   reason: {r.get('rejection_reason', '?')} "
             f"({r.get('rejection_detail', '')})",
         ]
@@ -1230,10 +1275,11 @@ def format_decision_log(decision: dict) -> str:
 
     fee_adjusted = decision.get("fee_adjusted")
     if fee_adjusted:
+        # gross_pick_label is side-aware (compute_display_label), so don't
+        # re-append gross_pick_side — would yield "DET wins YES".
         fee_line = (
             f"  fee_adjusted: YES — gross ranking would have picked "
-            f"{decision.get('gross_pick_label', '?')} "
-            f"{decision.get('gross_pick_side', '?')}"
+            f"{decision.get('gross_pick_label', '?')}"
         )
     else:
         fee_line = "  fee_adjusted: NO (gross and net rankings agree on #1)"
