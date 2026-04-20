@@ -33,12 +33,16 @@ function EventButton({ event, trade, disabled, onBuy, multiMarket = false }) {
   const basket = (trade?.all_trades || []).filter(t => (t?.ev_per_contract ?? 0) > 0)
   const isBasket = multiMarket && basket.length > 1
 
-  // In multi mode with a basket, show the combined profit across every
+  // In multi mode with a basket, show the combined figure across every
   // market that will fire. Otherwise fall back to the single best trade.
   const estimatedProfit = isBasket
     ? basket.reduce((s, t) => s + (t.estimated_profit ?? 0), 0)
     : trade?.estimated_profit
   const profit = estimatedProfit ?? 0
+  const totalEv = isBasket
+    ? basket.reduce((s, t) => s + (t.total_ev ?? 0), 0)
+    : trade?.total_ev
+  const ev = totalEv ?? 0
   const prevProfit = useRef(estimatedProfit)
 
   useEffect(() => {
@@ -55,16 +59,10 @@ function EventButton({ event, trade, disabled, onBuy, multiMarket = false }) {
   const info = active ? priceInfo(trade) : null
   const inactive = profit <= 0 || !active
 
-  // Percentage always reflects the single best market's entry → target,
-  // per spec. The aggregated $ figure is in `profit` above.
-  const profitPct = info && info.entryCents > 0
-    ? Math.round(((info.targetCents - info.entryCents) / info.entryCents) * 100)
-    : null
-
   let accent = 'blue'
   if (!inactive) {
-    if (profit > 15) accent = 'emerald'
-    else if (profit >= 5) accent = 'teal'
+    if (ev > 15) accent = 'emerald'
+    else if (ev >= 5) accent = 'teal'
     else accent = 'blue'
   }
 
@@ -116,7 +114,7 @@ function EventButton({ event, trade, disabled, onBuy, multiMarket = false }) {
         <div className={stackClasses}>
           <span className="text-lg font-black text-white leading-none">{event}</span>
           <span className={`text-sm font-bold font-mono leading-none ${profitColor[accent]}`}>
-            {profitPct != null ? `+${profitPct}%` : '—'}
+            {Number.isFinite(ev) ? `+$${ev.toFixed(2)}` : '—'}
           </span>
           {info && (
             <span className="text-[11px] text-slate-400 font-mono leading-none truncate max-w-full">
@@ -145,11 +143,12 @@ export default memo(EventButton, (prev, next) => {
   const sig = (t) => {
     const a = t.all_trades || []
     const n = a.length
-    const s = a.reduce((x, y) => x + (y.estimated_profit ?? 0), 0)
+    const s = a.reduce((x, y) => x + (y.total_ev ?? 0), 0)
     return `${n}|${s.toFixed(2)}`
   }
   return (
     pt.estimated_profit === nt.estimated_profit &&
+    pt.total_ev === nt.total_ev &&
     pt.active === nt.active &&
     pt.market_ticker === nt.market_ticker &&
     pt.side === nt.side &&
