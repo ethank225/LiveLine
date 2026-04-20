@@ -33,7 +33,6 @@ createRoot(document.getElementById('root')).render(
           <Route path="/settings" element={<RequireAuth><Settings /></RequireAuth>} />
         </Routes>
       </BrowserRouter>
-      <Analytics />
     </AuthProvider>
   </StrictMode>,
 )
