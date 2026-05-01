@@ -144,3 +144,116 @@ class TestAsymmetricCoverage:
         """Games whose market discovery returned no spread tickers at
         all (rare, but possible on Kalshi) must not crash."""
         assert _pick_spread_markets_both_sides(0, []) == []
+
+
+# ---------------------------------------------------------------------------
+# Backtest twin: backtests.core.kalshi_sync._pick_spread_specs_both_sides
+#
+# Same regression risk as the live wrapper above — the backtest used to
+# call pick_spread_line independently on the away (negated) bucket, which
+# fell through to the closest-abs fallback and produced non-mirror picks.
+# Tests below exercise the symmetric path, the asymmetric path, and the
+# fallback branch (margin > max(home_bucket)) which the live tests don't
+# cover at the wrapper level.
+# ---------------------------------------------------------------------------
+
+from backtests.core.mlb import MarketSpec
+from backtests.core.kalshi_sync import _pick_spread_specs_both_sides
+
+
+def _spec(line: float, *, flip: bool, ticker: str) -> MarketSpec:
+    return MarketSpec(
+        ticker=ticker,
+        market_type="spread",
+        line=line,
+        delta_key=f"sp_{-line if flip else line}",
+        flip=flip,
+        label=f"SPR {ticker}",
+    )
+
+
+class TestBacktestWrapper:
+    def test_backtest_wrapper_fallback_with_mirror_present(self):
+        """Symmetric ±{1.5,2.5,3.5} bucket, margin=4. Home falls back to
+        3.5 (largest, picked by closest-abs accident); the away mirror at
+        -3.5 must be located by direct lookup, not by re-running
+        pick_spread_line on the negated bucket (which would have returned
+        -1.5 — closest abs to +4)."""
+        specs = [
+            _spec(1.5, flip=False, ticker="HOME-1"),
+            _spec(2.5, flip=False, ticker="HOME-2"),
+            _spec(3.5, flip=False, ticker="HOME-3"),
+            _spec(-1.5, flip=True, ticker="AWAY-1"),
+            _spec(-2.5, flip=True, ticker="AWAY-2"),
+            _spec(-3.5, flip=True, ticker="AWAY-3"),
+        ]
+
+        picks = _pick_spread_specs_both_sides(4, specs)
+
+        assert len(picks) == 2
+        home, away = picks
+        assert home.flip is False and home.line == 3.5
+        assert away.flip is True and away.line == -3.5
+        assert away.ticker == "AWAY-3"
+
+    def test_backtest_wrapper_fallback_with_mirror_absent(self):
+        """Home bucket {1.5,2.5,3.5}, away bucket {-1.5,-2.5} (no -3.5
+        mirror). Margin=4 → home falls back to 3.5; mirror -3.5 absent.
+        Wrapper must return home-only rather than substituting the wrong
+        away line."""
+        specs = [
+            _spec(1.5, flip=False, ticker="HOME-1"),
+            _spec(2.5, flip=False, ticker="HOME-2"),
+            _spec(3.5, flip=False, ticker="HOME-3"),
+            _spec(-1.5, flip=True, ticker="AWAY-1"),
+            _spec(-2.5, flip=True, ticker="AWAY-2"),
+        ]
+
+        picks = _pick_spread_specs_both_sides(4, specs)
+
+        assert len(picks) == 1
+        assert picks[0].flip is False and picks[0].line == 3.5
+
+    def test_backtest_wrapper_negative_margin(self):
+        """Away leading by 3 (margin=-3). Home bucket has positive lines,
+        every dist = c.line - (-3) > 0, so primary path picks the smallest
+        positive line (1.5). Mirror at -1.5 must pair correctly. This is
+        the case where the previous implementation also picked an away
+        line by abs() coincidence; verify the new mirror lookup matches."""
+        specs = [
+            _spec(1.5, flip=False, ticker="HOME-1"),
+            _spec(2.5, flip=False, ticker="HOME-2"),
+            _spec(3.5, flip=False, ticker="HOME-3"),
+            _spec(-1.5, flip=True, ticker="AWAY-1"),
+            _spec(-2.5, flip=True, ticker="AWAY-2"),
+            _spec(-3.5, flip=True, ticker="AWAY-3"),
+        ]
+
+        picks = _pick_spread_specs_both_sides(-3, specs)
+
+        assert len(picks) == 2
+        home, away = picks
+        assert home.line == 1.5 and home.ticker == "HOME-1"
+        assert away.line == -1.5 and away.ticker == "AWAY-1"
+
+    def test_backtest_wrapper_home_shorter_than_away(self):
+        """Home {1.5,2.5}, away {-1.5,-2.5,-3.5}, margin=4. Home falls
+        back to 2.5 (largest available on its side). Mirror -2.5 exists
+        and must be chosen — not -3.5, even though -3.5 is the better
+        dog-cover line for a 4-run lead. The wrapper anchors on home and
+        mirrors; it doesn't try to optimize the away pick independently."""
+        specs = [
+            _spec(1.5, flip=False, ticker="HOME-1"),
+            _spec(2.5, flip=False, ticker="HOME-2"),
+            _spec(-1.5, flip=True, ticker="AWAY-1"),
+            _spec(-2.5, flip=True, ticker="AWAY-2"),
+            _spec(-3.5, flip=True, ticker="AWAY-3"),
+        ]
+
+        picks = _pick_spread_specs_both_sides(4, specs)
+
+        assert len(picks) == 2
+        home, away = picks
+        assert home.line == 2.5
+        assert away.line == -2.5
+        assert away.ticker == "AWAY-2"

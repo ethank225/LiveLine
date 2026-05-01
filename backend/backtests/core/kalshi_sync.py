@@ -285,13 +285,29 @@ def _pick_spread_spec(margin: int, spread_specs: list[MarketSpec]) -> MarketSpec
 def _pick_spread_specs_both_sides(
     margin: int, spread_specs: list[MarketSpec]
 ) -> list[MarketSpec]:
-    """Mirror of market_selector._pick_spread_markets_both_sides — returns
-    one home-side and one away-side spread per play. Live picker considers
-    both; backtest used to take only one, leaving roughly half the spread
-    candidates out of the pool."""
-    home_side = pick_spread_line(margin, [s for s in spread_specs if not s.flip])
-    away_side = pick_spread_line(margin, [s for s in spread_specs if s.flip])
-    return [s for s in (home_side, away_side) if s is not None]
+    """Mirror of `market_selector._pick_spread_markets_both_sides` — pick
+    the home-side line via `pick_spread_line`, then locate the away-side
+    spec whose stored line is the negation. Never run `pick_spread_line`
+    on the negated bucket: its "smallest dist > 0" rule never matches when
+    every candidate's line is negative, so it falls through to closest-abs
+    and the away pick was a non-mirror line (e.g. home line=2.5 paired
+    with away line=-0.5 instead of -2.5). See the docstring on the live
+    twin for the full history."""
+    home_bucket = [s for s in spread_specs if not s.flip]
+    away_bucket = [s for s in spread_specs if s.flip]
+
+    home_side = pick_spread_line(margin, home_bucket)
+    if home_side is None:
+        return []
+
+    mirror_line = -home_side.line
+    away_side = next(
+        (s for s in away_bucket if s.line == mirror_line),
+        None,
+    )
+    if away_side is None:
+        return [home_side]
+    return [home_side, away_side]
 
 
 def _pick_ou_spec(total_runs: int, ou_specs: list[MarketSpec]) -> MarketSpec | None:
