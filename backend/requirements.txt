@@ -5,3 +5,4 @@ pykalshi==1.0.4
 supabase
 pyjwt
 python-dotenv
+pandas
