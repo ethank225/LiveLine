@@ -8,6 +8,7 @@ from app.engine import (
     compute_spread_probability,
     _runs_scored,
 )
+from app.regime_caps import cap_spread_predicted_move
 from backtests.core.mlb import PlayRecord
 
 
@@ -88,6 +89,13 @@ def enrich_with_model(records: list[PlayRecord]):
                 after = compute_spread_probability(*after_args, line)
             else:
                 after = before
-            rec.model_deltas[f"sp_{line}"] = round(after - before, 6)
+            raw_delta = after - before
+            capped = cap_spread_predicted_move(
+                raw_delta,
+                inning=rec.inning,
+                margin=rec.home_score - rec.away_score,
+                market_type="spread",
+            )
+            rec.model_deltas[f"sp_{line}"] = round(capped, 6)
 
         rec.model_deltas["ml"] = round(rec.ml_delta, 6)

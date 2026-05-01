@@ -15,6 +15,7 @@ from app.constants import (
     ALL_OU_LINES, ALL_SPREAD_LINES,
     DEFAULT_OU_LINES, DEFAULT_SPREAD_LINES,
 )
+from app.regime_caps import cap_spread_predicted_move
 
 _DATA = Path(__file__).parent.parent / "data"
 
@@ -497,10 +498,17 @@ def compute_deltas(
                 for line in use_sp:
                     before = cur_sp[str(line)]
                     after = sp_after_acc[str(line)]
+                    raw_delta = after - before
+                    capped = cap_spread_predicted_move(
+                        raw_delta,
+                        inning=state.inning,
+                        margin=home_score - away_score,
+                        market_type="spread",
+                    )
                     sp_dict[str(line)] = {
                         "before": round(before, 4),
                         "after": round(after, 4),
-                        "delta": round(after - before, 4),
+                        "delta": round(capped, 4),
                     }
 
             deltas.append(EventDelta(
@@ -562,10 +570,17 @@ def compute_deltas(
                         new_home, new_away, ns.inning, ns.half, ns.outs, ns.runners, line,
                     )
                 before = cur_sp[str(line)]
+                raw_delta = after - before
+                capped = cap_spread_predicted_move(
+                    raw_delta,
+                    inning=state.inning,
+                    margin=home_score - away_score,
+                    market_type="spread",
+                )
                 sp_dict[str(line)] = {
                     "before": round(before, 4),
                     "after": round(after, 4),
-                    "delta": round(after - before, 4),
+                    "delta": round(capped, 4),
                 }
 
         deltas.append(EventDelta(

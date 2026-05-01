@@ -40,6 +40,18 @@ BLOWOUT_THRESHOLD = 5        # |score_diff| >= this skips moneyline
 HIGH_LEV_ML_THRESHOLD = 0.01
 HIGH_LEV_OU_PROXIMITY = 3
 
+# Regime-aware cap on SPR predicted moves in late-tied games.
+# In inning >= 9 AND |margin| <= 1 AND market_type == "spread", the engine's
+# unconditional run distribution overstates 30s window moves by ~3.8x relative
+# to Kalshi's late-game-conditioned reality. Cap |predicted| at the empirical
+# ceiling so downstream EV/sizing/target math runs on calibrated numbers.
+# Re-validate the value when the market or model changes — the cap is an
+# empirical regime correction, not a derived physical ceiling.
+SPR_LATE_TIED_CAP_INNING = 9
+SPR_LATE_TIED_CAP_MARGIN = 1
+SPR_LATE_TIED_CAP_VALUE = 0.10
+SPR_LATE_TIED_CAP_ENABLED = True
+
 # ---------------------------------------------------------------------------
 # Backtest-specific
 # ---------------------------------------------------------------------------
