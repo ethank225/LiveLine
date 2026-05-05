@@ -414,6 +414,7 @@ def _snapshot_sibling_markets(
                     db.log_orderbook_snapshot(
                         trade_db_id, game_id, info.ticker, side, book,
                         market_type=info.market_type,
+                        phase="post",
                     )
                 except Exception as e:
                     logger.error(
@@ -853,6 +854,49 @@ class Trade:
 
         self.requested_quantity = quantity
         self.entry_price = sizing["vwap"]
+
+        # Pre-trade orderbook snapshot. Captured here — AFTER sizing,
+        # BEFORE _place_order — so the recorded ladder reflects exactly
+        # what the sizer saw. Read is from the local websocket book
+        # (sub-millisecond, in-memory); `local_only=True` skips REST
+        # fallback so a cold book never adds network latency to the
+        # critical path. The Supabase insert is deferred until after
+        # _log_to_db() returns the FK trade_db_id, dispatched via daemon
+        # thread so DB RTT also stays off-path.
+        pre_book: dict | None = None
+        pre_captured_at: datetime | None = None
+        try:
+            snap = kalshi.get_orderbook_snapshot(
+                self.market_ticker, self.side, levels=5, local_only=True,
+            )
+            if snap["bids"] or snap["asks"]:
+                pre_book = snap
+                pre_captured_at = datetime.utcnow()
+                asks = snap.get("asks") or []
+                best_ask = asks[0][0] if asks else None
+                if asks:
+                    threshold = best_ask + 0.05 + 1e-9
+                    depth_within_5c = sum(
+                        int(q) for p, q in asks if float(p) <= threshold
+                    )
+                else:
+                    depth_within_5c = 0
+                logger.info(
+                    f"[ORDERBOOK pre {self.id[:8]}] "
+                    f"ticker={self._short} side={self.side} "
+                    f"best_ask={best_ask if best_ask is not None else 'n/a'} "
+                    f"depth_within_5c={depth_within_5c} "
+                    f"top_asks={asks[:3]}"
+                )
+            else:
+                logger.warning(
+                    f"{self._log_prefix} pre-trade snapshot skipped: "
+                    f"local book empty for {self.market_ticker} "
+                    f"(REST fallback would block order submission)"
+                )
+        except Exception as e:
+            # Instrumentation failure must never block the trade.
+            logger.error(f"pre-trade snapshot capture failed: {e}")
         stop_cents = self._settings.get("stop_loss_cents", STOP_LOSS_CENTS)
         self.stop_loss = max(0.01, round(self.entry_price - stop_cents / 100, 2))
 
@@ -955,10 +999,15 @@ class Trade:
         # the book here?" without replaying the websocket, and compares
         # the traded market against its siblings at the exact same
         # moment. Fire-and-forget daemon threads so Supabase latency
-        # never blocks the trade path. The traded-ticker snapshot is
-        # skipped when:
-        #   - trade_db_id is None (DB insert failed, no FK target), or
-        #   - local book is empty (freshly subscribed, no snapshot yet).
+        # never blocks the trade path.
+        #
+        # Two writes for the traded ticker:
+        #   - phase='pre':  the in-memory `pre_book` captured before the
+        #                   IOC fired (the book the sizer actually saw).
+        #   - phase='post': a fresh local-book read here — reflects the
+        #                   ladder after our take (and any market reaction).
+        # Sibling snapshots are post-fire by construction.
+        # Both are skipped when trade_db_id is None (no FK target).
         try:
             if self.trade_db_id is None:
                 logger.info(
@@ -966,22 +1015,58 @@ class Trade:
                     f"trade_db_id is None"
                 )
             else:
+                if pre_book is not None:
+                    threading.Thread(
+                        target=db.log_orderbook_snapshot,
+                        args=(
+                            self.trade_db_id, self.game_id,
+                            self.market_ticker, self.side, pre_book,
+                        ),
+                        kwargs={
+                            "market_type": self.market_type,
+                            "phase": "pre",
+                            "captured_at": pre_captured_at,
+                        },
+                        daemon=True,
+                    ).start()
+
+                post_captured_at = datetime.utcnow()
                 book = kalshi.get_orderbook_snapshot(
                     self.market_ticker, self.side, levels=5,
                 )
                 if not book["bids"] and not book["asks"]:
                     logger.info(
-                        f"{self._log_prefix} orderbook snapshot skipped: "
+                        f"{self._log_prefix} post-trade snapshot skipped: "
                         f"empty local book for {self.market_ticker}"
                     )
                 else:
+                    asks_post = book.get("asks") or []
+                    best_ask_post = asks_post[0][0] if asks_post else None
+                    if asks_post:
+                        threshold = best_ask_post + 0.05 + 1e-9
+                        depth_within_5c_post = sum(
+                            int(q) for p, q in asks_post if float(p) <= threshold
+                        )
+                    else:
+                        depth_within_5c_post = 0
+                    logger.info(
+                        f"[ORDERBOOK post {self.id[:8]}] "
+                        f"ticker={self._short} side={self.side} "
+                        f"best_ask={best_ask_post if best_ask_post is not None else 'n/a'} "
+                        f"depth_within_5c={depth_within_5c_post} "
+                        f"top_asks={asks_post[:3]}"
+                    )
                     threading.Thread(
                         target=db.log_orderbook_snapshot,
                         args=(
                             self.trade_db_id, self.game_id,
                             self.market_ticker, self.side, book,
                         ),
-                        kwargs={"market_type": self.market_type},
+                        kwargs={
+                            "market_type": self.market_type,
+                            "phase": "post",
+                            "captured_at": post_captured_at,
+                        },
                         daemon=True,
                     ).start()
 

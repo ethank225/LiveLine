@@ -220,8 +220,34 @@ alter table public.orderbook_snapshots
   add column if not exists depth_within_2c integer,
   add column if not exists depth_within_3c integer;
 
+-- phase: 'pre' captured immediately before the IOC buy goes over the
+-- wire (reflects the book the sizer used); 'post' captured after fill
+-- (reflects the book depleted by our take + any market reaction).
+-- Default 'post' backfills historical rows correctly — every existing
+-- row was captured at the post-fill point, so 'post' is what they are.
+alter table public.orderbook_snapshots
+  add column if not exists phase text not null default 'post';
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'orderbook_snapshots_phase_check'
+  ) then
+    alter table public.orderbook_snapshots
+      add constraint orderbook_snapshots_phase_check
+      check (phase in ('pre', 'post'));
+  end if;
+end $$;
+
 create index if not exists ob_snap_trade_idx
   on public.orderbook_snapshots (trade_id)
+  where trade_id is not null;
+
+-- Per-trade phase queries ("did we capture both pre and post for this
+-- trade?") run on every diagnostic; cheap composite index keeps them
+-- index-only.
+create index if not exists ob_snap_trade_phase_idx
+  on public.orderbook_snapshots (trade_id, phase)
   where trade_id is not null;
 
 -- ============================================================

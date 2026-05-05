@@ -550,6 +550,8 @@ def log_orderbook_snapshot(
     side: str,
     book: dict,
     market_type: str | None = None,
+    phase: str = "post",
+    captured_at: datetime | None = None,
 ) -> None:
     """Flatten a top-N `book` dict from `kalshi.get_orderbook_snapshot`
     into a single `orderbook_snapshots` row keyed by `trade_id`.
@@ -561,6 +563,12 @@ def log_orderbook_snapshot(
     `spread` = best_ask − best_bid in `side`-units. `depth_within_Nc` is
     cumulative bid-qty within N cents of the best bid — the exit-side
     depth that drives has_exit_liquidity. NULL when the book has no bids.
+
+    `phase` distinguishes 'pre' (captured before the IOC fires; reflects
+    the book the sizer saw) from 'post' (captured after fill; reflects
+    the book depleted by our take). `captured_at` overrides the schema's
+    `default now()` timestamp so the recorded time matches the moment of
+    book observation, not the moment the daemon thread reaches Supabase.
     """
     client = _get_client()
     if client is None or not trade_id:
@@ -574,9 +582,15 @@ def log_orderbook_snapshot(
             "market_ticker": market_ticker,
             "side": side,
             "market_type": market_type,
+            "phase": phase,
             "total_bid_depth": int(book.get("total_bid_depth") or 0),
             "total_ask_depth": int(book.get("total_ask_depth") or 0),
         }
+        if captured_at is not None:
+            ts = captured_at
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            row["timestamp"] = ts.isoformat()
         if bids and asks:
             row["spread"] = round(float(asks[0][0]) - float(bids[0][0]), 4)
         if bids:

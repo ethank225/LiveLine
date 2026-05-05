@@ -429,6 +429,7 @@ class KalshiManager:
 
     def get_orderbook_snapshot(
         self, ticker: str, side: str, levels: int = 5,
+        local_only: bool = False,
     ) -> dict:
         """Read top-N bid/ask levels for a ticker, in the trade's side-units.
 
@@ -443,6 +444,12 @@ class KalshiManager:
         REST when the orderbook channel isn't subscribed (we only sub
         `ticker`, not `orderbook_delta`, due to a prior MLB-feed crash).
         Returns empties when both paths fail.
+
+        `local_only=True` is for callers on a latency-sensitive path
+        (e.g. the pre-trade snapshot capture in Trade.execute): if the
+        local book is missing or empty, return empties WITHOUT issuing
+        the REST round-trip. The caller is expected to detect the empty
+        result and skip the snapshot rather than block order submission.
         """
         def _format(bid_raw, ask_raw):
             return {
@@ -479,6 +486,8 @@ class KalshiManager:
                 return _format(bid_raw, ask_raw)
 
         # REST fallback: local book empty or never populated.
+        if local_only:
+            return {"bids": [], "asks": [], "total_bid_depth": 0, "total_ask_depth": 0}
         if not self.client:
             return {"bids": [], "asks": [], "total_bid_depth": 0, "total_ask_depth": 0}
 
