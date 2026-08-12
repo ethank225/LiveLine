@@ -1,12 +1,11 @@
-<img width="585" height="1266" alt="IMG_4493" src="https://github.com/user-attachments/assets/d6d08d69-30fd-40d5-8364-d956db504bfa" />
 # LiveLine
-
 Live trading against Kalshi MLB prediction markets, driven by a baseball win-expectancy engine.
 
 LiveLine watches every pitch of an MLB game, scores each possible at-bat outcome (single, double, HR, K, etc.) against its effect on win probability + over/under + spread contracts on Kalshi, and surfaces the one trade per batting event that currently has positive expected value. When you tap a button, the backend places a real IOC buy + resting limit sell on Kalshi and tracks the position to exit.
 
-Live at [liveline.watch](https://liveline.watch).
-
+<p align="center">
+  <img width="250" alt="IMG_4493" src="https://github.com/user-attachments/assets/d6d08d69-30fd-40d5-8364-d956db504bfa" />
+</p>
 ---
 
 ## How it works
