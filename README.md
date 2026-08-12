@@ -1,3 +1,4 @@
+<img width="585" height="1266" alt="IMG_4493" src="https://github.com/user-attachments/assets/d6d08d69-30fd-40d5-8364-d956db504bfa" />
 # LiveLine
 
 Live trading against Kalshi MLB prediction markets, driven by a baseball win-expectancy engine.
